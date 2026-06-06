@@ -32,7 +32,13 @@ export default function NotificationsScreen() {
   return (
     <C3SScreen>
       <C3SPage>
-        <C3SScreenHeader title="Alerts" subtitle="Flow exceptions tied to batch ownership, location, and next action" />
+        <C3SScreenHeader title="Alerts" subtitle="Local simulation alerts only. Live Firestore alert feed is not enabled yet." />
+        <C3SCard borderColor="#FFA726">
+          <Text style={styles.localOnlyTitle}>Simulation Mode</Text>
+          <Text style={styles.localOnlyText}>
+            These alerts come from local scenario simulation and blocked-state modeling. They do not represent a live Firestore `alerts` collection feed.
+          </Text>
+        </C3SCard>
 
         <View style={styles.filterRow}>
           {severityFilters.map((option) => {
@@ -63,6 +69,10 @@ export default function NotificationsScreen() {
               <View style={styles.metaRow}>
                 <Text style={styles.metaLabel}>Type</Text>
                 <Text style={styles.metaValue}>{item.type}</Text>
+              </View>
+              <View style={styles.metaRow}>
+                <Text style={styles.metaLabel}>Source</Text>
+                <Text style={styles.metaValue}>Local simulation</Text>
               </View>
               <View style={styles.metaRow}>
                 <Text style={styles.metaLabel}>Batch ID</Text>
@@ -143,7 +153,7 @@ export default function NotificationsScreen() {
 
           {filtered.length === 0 ? (
             <C3SCard>
-              <Text style={styles.emptyText}>No Active Alerts</Text>
+              <Text style={styles.emptyText}>No local simulation alerts in the selected filter.</Text>
             </C3SCard>
           ) : null}
         </ScrollView>
@@ -181,7 +191,19 @@ const styles = StyleSheet.create({
   filterRow: {
     flexDirection: 'row',
     gap: 8,
+    marginTop: 10,
     marginBottom: 10,
+  },
+  localOnlyTitle: {
+    color: '#FFB86B',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  localOnlyText: {
+    color: '#E6EDF3',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 4,
   },
   filterChip: {
     minHeight: 42,

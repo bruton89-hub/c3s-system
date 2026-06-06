@@ -1,0 +1,83 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "supervisor"];
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.auth.uid == userId;
+      allow update: if (signedIn() && request.auth.uid == userId) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /product_profiles/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /weekly_plan/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /prep_queue/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /smokehouses/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /chill_logs/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /chillers/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /qa_checks/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /packaging_logs/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /operational_events/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /alerts/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    // cook_logs — written by thermal operations, read by thermal/chill/QA screens.
+    match /cook_logs/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    // products — legacy master-list collection (separate from product_profiles).
+    // Admin-only writes; any signed-in user may read.
+    match /products/{docId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // operational_items — canonical state machine collection; any signed-in user may read/write.
+    match /operational_items/{docId} {
+      allow read, write: if signedIn();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

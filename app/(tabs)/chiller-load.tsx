@@ -1,889 +1,466 @@
-import { useMemo, useState } from 'react';
-import { useRouter } from 'expo-router';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useMemo, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+import { router } from 'expo-router';
 
 import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
 import {
-  BATCH_STAGES,
-  BATCH_STATUS_COLORS,
-  SMOKEHOUSES,
-  STAGE_COLORS,
-  getPrepStageDisplayLabel,
-  getStageDisplayLabel,
-} from '@/constants/c3s';
-import { useC3S, type BatchRecord } from '@/store/c3s-store';
+  assignChillLogToChiller,
+  finishChillLog,
+  flagChillLogDeviation,
+  getChillers,
+  getChillLogs,
+  getPrepQueueItems,
+  getQAChecks,
+  recordChillCheck,
+  type ChillerItem,
+  type ChillLogItem,
+  type PrepQueueItem,
+  type QACheckItem,
+} from '@/lib/firebase/repository';
 
-type CheckpointState = {
-  fiftyReached?: boolean;
-  oneThirtyReached?: boolean;
-  criticalReached?: boolean;
-  issueFlagged?: boolean;
-};
-type AttentionSeverity = 'warning' | 'urgent';
-type ThermalViewMode = 'batch' | 'equipment';
-
-const thermalStages = [
-  BATCH_STAGES.COOK,
-  BATCH_STAGES.SHOWER,
-  BATCH_STAGES.EVACUATE,
-  BATCH_STAGES.CHILL,
-  BATCH_STAGES.THERMAL_COOLER,
-] as const;
-
-const stageOrder: Record<string, number> = {
-  [BATCH_STAGES.COOK]: 0,
-  [BATCH_STAGES.SHOWER]: 1,
-  [BATCH_STAGES.EVACUATE]: 2,
-  [BATCH_STAGES.CHILL]: 3,
-  [BATCH_STAGES.THERMAL_COOLER]: 4,
-};
-
-function hashFromText(value: string) {
-  return value.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+function toOperatorMessage(error: unknown, fallback: string) {
+  if (!(error instanceof Error) || !error.message) return fallback;
+  const lowered = error.message.toLowerCase();
+  if (lowered.includes('permission')) return 'Action blocked by access rules.';
+  if (lowered.includes('network') || lowered.includes('offline') || lowered.includes('unavailable')) return 'Unable to reach Firestore.';
+  return error.message;
 }
 
-function inferCookMethod(product: string): 'smoke' | 'steam' {
-  const lower = product.toLowerCase();
-  if (lower.includes('smoked') || lower.includes('bacon') || lower.includes('ham') || lower.includes('sausage')) {
-    return 'smoke';
-  }
-  return 'steam';
+function prepNameFrom(log: ChillLogItem, prep?: PrepQueueItem | null) {
+  return log.productName || prep?.productNameSnapshot || prep?.productName || log.prepId || '—';
 }
 
-function checkpointStyle(complete: boolean, late = false) {
-  if (late) return { color: '#FFCDD2', borderColor: '#C62828', backgroundColor: '#3A1A1A' };
-  if (complete) return { color: '#C8E6C9', borderColor: '#2E7D32', backgroundColor: '#1B3320' };
-  return { color: '#E6EDF3', borderColor: '#455A64', backgroundColor: '#151A21' };
+function fmtTs(ms?: number) {
+  if (!ms || !Number.isFinite(ms)) return '—';
+  return new Date(ms).toLocaleString();
 }
 
-function getCheckpointSnapshot(batch: BatchRecord, marks: CheckpointState) {
-  const hash = hashFromText(batch.id);
-  const totalCookWindow = Math.max(batch.estimatedCookMinutes, 1);
-  const elapsedCookMinutes =
-    batch.stage === BATCH_STAGES.COOK
-      ? Math.min(totalCookWindow + 120, Math.max(18, Math.round(totalCookWindow * (0.48 + ((hash % 25) / 100)))))
-      : Math.max(45, Math.round(totalCookWindow * 0.92));
-
-  const checkpoint50Reached = marks.fiftyReached || elapsedCookMinutes >= 45 || batch.stage !== BATCH_STAGES.COOK;
-  const checkpoint130Reached =
-    marks.oneThirtyReached || elapsedCookMinutes >= 260 || batch.stage !== BATCH_STAGES.COOK;
-  const criticalReached =
-    marks.criticalReached || batch.stage !== BATCH_STAGES.COOK || elapsedCookMinutes >= totalCookWindow;
-  const expectedCookMinutes = batch.productProfile.estimatedCookMinutes;
-  const cookNeedsAttention =
-    (batch.stage === BATCH_STAGES.COOK || batch.stage === BATCH_STAGES.SHOWER || batch.stage === BATCH_STAGES.EVACUATE) &&
-    elapsedCookMinutes > expectedCookMinutes;
-  const cookActionRequired =
-    (batch.stage === BATCH_STAGES.COOK || batch.stage === BATCH_STAGES.SHOWER || batch.stage === BATCH_STAGES.EVACUATE) &&
-    elapsedCookMinutes > Math.round(expectedCookMinutes * 1.25);
-  const chillProgressFactor = 0.55 + ((hash % 30) / 100);
-  const elapsedChillMinutes =
-    batch.stage === BATCH_STAGES.CHILL
-      ? Math.max(12, Math.round(batch.productProfile.estimatedChillMinutes * chillProgressFactor))
-      : batch.stage === BATCH_STAGES.THERMAL_COOLER
-        ? batch.productProfile.estimatedChillMinutes + 10
-        : undefined;
-  const chillNeedsAttention =
-    elapsedChillMinutes !== undefined && elapsedChillMinutes > batch.productProfile.estimatedChillMinutes;
-  const chillActionRequired =
-    elapsedChillMinutes !== undefined &&
-    elapsedChillMinutes > Math.round(batch.productProfile.estimatedChillMinutes * 1.25);
-
-  const approaching130Deadline = !checkpoint130Reached && elapsedCookMinutes >= 300 && elapsedCookMinutes <= 360;
-  const missed130Deadline = !checkpoint130Reached && elapsedCookMinutes > 360;
-  const delayedTransfer =
-    batch.stage === BATCH_STAGES.CHILL &&
-    (batch.status === 'Delayed' || batch.minutesToReady > batch.estimatedChillMinutes + 75);
-  const smokeIssue =
-    inferCookMethod(batch.product) === 'smoke' &&
-    (marks.issueFlagged || (batch.stage === BATCH_STAGES.COOK && hash % 7 === 0));
-
-  const attentionItems: { label: string; severity: AttentionSeverity }[] = [
-    approaching130Deadline ? { label: 'Approaching 130F deadline', severity: 'warning' } : null,
-    missed130Deadline ? { label: 'Missed 130F (6-hour rule)', severity: 'urgent' } : null,
-    delayedTransfer ? { label: 'Transfer window exceeded', severity: 'urgent' } : null,
-    smokeIssue
-      ? {
-          label: marks.issueFlagged ? 'Critical unresolved issue' : 'Smoke monitoring issue',
-          severity: marks.issueFlagged ? 'urgent' : 'warning',
-        }
-      : null,
-    cookActionRequired
-      ? { label: 'Cook time significantly exceeded expected', severity: 'urgent' }
-      : cookNeedsAttention
-        ? { label: 'Cook elapsed above expected', severity: 'warning' }
-        : null,
-    chillActionRequired
-      ? { label: 'Chill time significantly exceeded expected', severity: 'urgent' }
-      : chillNeedsAttention
-        ? { label: 'Chill elapsed above expected', severity: 'warning' }
-        : null,
-  ].filter((item): item is { label: string; severity: AttentionSeverity } => !!item);
-
-  const attentionSeverity: AttentionSeverity | null = attentionItems.some((item) => item.severity === 'urgent')
-    ? 'urgent'
-    : attentionItems.length > 0
-      ? 'warning'
-      : null;
-  const attentionHeader =
-    attentionSeverity === 'urgent' ? 'Action Required' : attentionSeverity === 'warning' ? 'Needs Attention' : null;
-
-  return {
-    elapsedCookMinutes,
-    checkpoint50Reached,
-    checkpoint130Reached,
-    criticalReached,
-    approaching130Deadline,
-    missed130Deadline,
-    attentionItems,
-    attentionSeverity,
-    attentionHeader,
-    expectedCookMinutes,
-    elapsedChillMinutes,
-  };
+function elapsedText(ms?: number) {
+  if (!ms || !Number.isFinite(ms)) return '—';
+  const m = Math.floor((Date.now() - ms) / 60000);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
-function getSmokehouseNextCheckpoint(batch: BatchRecord, marks: CheckpointState, enabledTimelineActions: string[]) {
-  const snapshot = getCheckpointSnapshot(batch, marks);
-  if (batch.stage === BATCH_STAGES.COOK && !snapshot.checkpoint50Reached) return '50F checkpoint';
-  if (batch.stage === BATCH_STAGES.COOK && !snapshot.checkpoint130Reached) return '130F checkpoint (6h)';
-  if (batch.stage === BATCH_STAGES.COOK && !snapshot.criticalReached) return 'Critical temp confirm';
-  if (enabledTimelineActions.includes('Start Shower')) return 'Start shower';
-  if (enabledTimelineActions.includes('Complete Shower')) return 'Complete shower';
-  if (enabledTimelineActions.includes('Start Chill')) return 'Move to chill';
-  if (enabledTimelineActions.includes('Assign Chiller')) return 'Assign chiller';
-  if (enabledTimelineActions.includes('Complete Chill')) return 'Complete chill';
-  return 'Monitor';
+function chillerCapacity(label: string) {
+  const m = label.match(/(\d+)/);
+  const n = m ? Number(m[1]) : NaN;
+  if (n === 8) return 10;
+  return 18;
 }
 
 export default function ChillerLoadScreen() {
-  const router = useRouter();
-  const {
-    batches,
-    prepTickets,
-    equipmentReadiness,
-    assignPrepSmokehouse,
-    runTimelineAction,
-    getEnabledTimelineActions,
-    getChillerLoad,
-    getBatchFlowSnapshot,
-    canViewBatchInArea,
-  } = useC3S();
-  const [viewMode, setViewMode] = useState<ThermalViewMode>('batch');
-  const [checkpointMarks, setCheckpointMarks] = useState<Record<string, CheckpointState>>({});
-  const [assignmentRackCounts, setAssignmentRackCounts] = useState<Record<string, number>>({});
+  const [preps, setPreps] = useState<PrepQueueItem[]>([]);
+  const [chillLogs, setChillLogs] = useState<ChillLogItem[]>([]);
+  const [chillers, setChillers] = useState<ChillerItem[]>([]);
+  const [qaChecks, setQaChecks] = useState<QACheckItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
 
-  const thermalBatches = useMemo(
-    () =>
-      batches
-        .filter((batch) => canViewBatchInArea('thermal', batch.id))
-        .filter((batch) => thermalStages.includes(batch.stage as (typeof thermalStages)[number]))
-        .sort((a, b) => {
-          const stageDelta = stageOrder[a.stage] - stageOrder[b.stage];
-          if (stageDelta !== 0) return stageDelta;
-          if (a.status === 'Delayed' && b.status !== 'Delayed') return -1;
-          if (b.status === 'Delayed' && a.status !== 'Delayed') return 1;
-          return a.id.localeCompare(b.id);
-        }),
-    [batches, canViewBatchInArea],
+  const [selectedChillerByLogId, setSelectedChillerByLogId] = useState<Record<string, string>>({});
+  const [checkMinutesByLogId, setCheckMinutesByLogId] = useState<Record<string, string>>({});
+  const [checkTypeByLogId, setCheckTypeByLogId] = useState<Record<string, '50' | '40'>>({});
+  const [signoutTempByLogId, setSignoutTempByLogId] = useState<Record<string, string>>({});
+  const [workingId, setWorkingId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setIsLoading(true);
+      setLoadError(null);
+      const [p, c, ch, q] = await Promise.all([
+        getPrepQueueItems(),
+        getChillLogs(),
+        getChillers(),
+        getQAChecks(),
+      ]);
+      setPreps(p);
+      setChillLogs(c);
+      setChillers(ch);
+      setQaChecks(q);
+    } catch (e) {
+      setLoadError(toOperatorMessage(e, 'Failed to load chill data.'));
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  const prepById = useMemo(
+    () => preps.reduce<Record<string, PrepQueueItem>>((map, p) => { map[p.id] = p; return map; }, {}),
+    [preps],
   );
 
-  const thermalAssignmentQueue = useMemo(
-    () =>
-      prepTickets
-        .filter((ticket) => ticket.awaitingThermalAssignment && !ticket.linkedBatchId)
-        .sort((a, b) => a.requestedStart.localeCompare(b.requestedStart)),
-    [prepTickets],
+  const awaitingAssignment = useMemo(
+    () => chillLogs.filter((l) => l.status === 'waiting'),
+    [chillLogs],
   );
 
-  const smokehouseRows = useMemo(
-    () =>
-      SMOKEHOUSES.map((smokehouseId) => {
-        const loadedBatch = thermalBatches.find(
-          (batch) =>
-            batch.smokehouse === smokehouseId &&
-            (batch.stage === BATCH_STAGES.COOK ||
-              batch.stage === BATCH_STAGES.SHOWER ||
-              batch.stage === BATCH_STAGES.EVACUATE),
-        );
-        const readiness = equipmentReadiness.find((item) => item.id === `SH-${smokehouseId}`);
-        const status = loadedBatch ? 'Loaded' : !readiness?.ready || !readiness.clean ? 'Cleaning' : 'Available';
-        const marks = loadedBatch ? checkpointMarks[loadedBatch.id] ?? {} : {};
-        const enabledActions = loadedBatch ? getEnabledTimelineActions(loadedBatch.id) : [];
-
-        return {
-          smokehouseId,
-          status,
-          loadedBatch,
-          elapsedMinutes: loadedBatch ? getCheckpointSnapshot(loadedBatch, marks).elapsedCookMinutes : null,
-          nextCheckpoint: loadedBatch ? getSmokehouseNextCheckpoint(loadedBatch, marks, enabledActions) : null,
-        };
-      }),
-    [thermalBatches, equipmentReadiness, checkpointMarks, getEnabledTimelineActions],
+  const running = useMemo(
+    () => chillLogs.filter((l) => l.status === 'running'),
+    [chillLogs],
   );
 
-  const chillerRows = useMemo(() => {
-    const chillerLoad = getChillerLoad();
-    return chillerLoad.map((load) => {
-      const occupiedBatch =
-        load.assignedBatchIds.length > 0 ? batches.find((batch) => batch.id === load.assignedBatchIds[0]) : null;
-      const snapshot = occupiedBatch ? getCheckpointSnapshot(occupiedBatch, checkpointMarks[occupiedBatch.id] ?? {}) : null;
-      const nextCheck =
-        occupiedBatch && occupiedBatch.stage === BATCH_STAGES.CHILL
-          ? 'Scheduled chill temp check'
-          : occupiedBatch && occupiedBatch.stage === BATCH_STAGES.THERMAL_COOLER
-            ? 'Thermal sign-out / QA handoff'
-            : null;
+  const checkDue = useMemo(
+    () => running.filter((l) => l.timeTo50F == null || l.timeTo40F == null),
+    [running],
+  );
 
-      return {
-        chillerId: `CH-${load.chillerNumber}`,
-        status: load.status,
-        occupiedBatch,
-        timeInChill: snapshot?.elapsedChillMinutes ?? null,
-        nextCheck,
-      };
+  const readyForQa = useMemo(
+    () => qaChecks.filter((q) => q.status === 'ready_for_qa'),
+    [qaChecks],
+  );
+
+  const holdDeviation = useMemo(
+    () => chillLogs.filter((l) => l.status === 'deviation' || l.hasDeviation),
+    [chillLogs],
+  );
+
+  const chillerStrip = useMemo(() => {
+    const byName = chillers.reduce<Record<string, ChillerItem>>((m, c) => { m[c.name] = c; return m; }, {});
+    return Array.from({ length: 13 }, (_, idx) => String(idx + 4)).map((n) => {
+      const name = `Chiller ${n}`;
+      const item = byName[name] ?? null;
+      const load = running
+        .filter((log) => {
+          const assigned = log.chillerId ? chillers.find((c) => c.id === log.chillerId)?.name : null;
+          return assigned === name;
+        })
+        .reduce((sum, log) => sum + (log.racks ?? 0), 0);
+      const cap = chillerCapacity(name);
+      return { name, item, load, cap, overload: load > cap };
     });
-  }, [getChillerLoad, batches, checkpointMarks]);
+  }, [chillers, running]);
 
-  const updateCheckpoint = (batchId: string, update: Partial<CheckpointState>) => {
-    setCheckpointMarks((prev) => ({
-      ...prev,
-      [batchId]: {
-        ...prev[batchId],
-        ...update,
-      },
-    }));
-  };
+  async function onAssign(log: ChillLogItem) {
+    const chillerId = selectedChillerByLogId[log.id];
+    if (!chillerId) {
+      setActionMsg('Select a chiller before assigning.');
+      return;
+    }
+    try {
+      setWorkingId(log.id);
+      await assignChillLogToChiller(log.id, chillerId);
+      setActionMsg(`Assigned ${prepNameFrom(log, prepById[log.prepId])} to selected chiller.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to assign chiller.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
 
-  const confirmAction = (title: string, message: string, action: () => void) => {
-    Alert.alert(title, message, [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Confirm', style: 'default', onPress: action },
-    ]);
-  };
+  async function onRecordCheck(log: ChillLogItem) {
+    const raw = checkMinutesByLogId[log.id] ?? '';
+    const value = Number(raw);
+    const type = checkTypeByLogId[log.id] ?? (log.timeTo50F == null ? '50' : '40');
+    if (!Number.isFinite(value) || value <= 0) {
+      setActionMsg('Enter valid minutes for chill check.');
+      return;
+    }
+    try {
+      setWorkingId(log.id);
+      await recordChillCheck(log.id, type === '50' ? { timeTo50F: value } : { timeTo40F: value });
+      setActionMsg(`Recorded ${type}°F chill check for ${prepNameFrom(log, prepById[log.prepId])}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to record chill check.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
 
-  const adjustAssignmentRacks = (prepId: string, base: number, delta: number) => {
-    setAssignmentRackCounts((prev) => {
-      const current = prev[prepId] ?? base;
-      return { ...prev, [prepId]: Math.max(1, current + delta) };
-    });
-  };
+  async function onSendToQa(log: ChillLogItem) {
+    const tempRaw = signoutTempByLogId[log.id] ?? '40';
+    const temp = Number(tempRaw);
+    if (!Number.isFinite(temp) || temp <= 0) {
+      setActionMsg('Enter valid sign-out temp.');
+      return;
+    }
+    try {
+      setWorkingId(log.id);
+      await finishChillLog(log.id, {
+        signedOutTemp: temp,
+        timeTo50F: log.timeTo50F ?? undefined,
+        timeTo40F: log.timeTo40F ?? undefined,
+      });
+      setActionMsg(`Marked ready for QA: ${prepNameFrom(log, prepById[log.prepId])}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to send to QA.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
+
+  async function onFlagDeviation(log: ChillLogItem) {
+    try {
+      setWorkingId(log.id);
+      await flagChillLogDeviation(log.id, 'Marked from Chiller Load hold/deviation review.');
+      setActionMsg(`Flagged deviation for ${prepNameFrom(log, prepById[log.prepId])}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to flag deviation.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
 
   return (
     <C3SScreen>
       <C3SPage>
         <C3SScreenHeader
-          title="Thermal Operations"
-          subtitle="Operator-first thermal flow: cook checkpoints, risk flags, and next action"
+          title="Chiller Load"
+          subtitle={`Awaiting Chiller Assignment: ${awaitingAssignment.length}`}
+          right={<Pressable style={styles.refreshBtn} onPress={load}><Text style={styles.refreshText}>Refresh</Text></Pressable>}
         />
 
-        <ScrollView contentContainerStyle={styles.listContent} showsVerticalScrollIndicator={false}>
-          <View style={styles.viewToggleRow}>
-            <Pressable
-              style={[styles.viewToggleButton, viewMode === 'batch' ? styles.viewToggleActive : styles.viewToggleInactive]}
-              onPress={() => setViewMode('batch')}>
-              <Text style={[styles.viewToggleText, viewMode === 'batch' ? styles.viewToggleTextActive : null]}>Batch View</Text>
-            </Pressable>
-            <Pressable
-              style={[
-                styles.viewToggleButton,
-                viewMode === 'equipment' ? styles.viewToggleActive : styles.viewToggleInactive,
-              ]}
-              onPress={() => setViewMode('equipment')}>
-              <Text style={[styles.viewToggleText, viewMode === 'equipment' ? styles.viewToggleTextActive : null]}>
-                Equipment View
-              </Text>
-            </Pressable>
-          </View>
+        <ScrollView contentContainerStyle={styles.content}>
+          {isLoading ? <Text style={styles.info}>Loading chill execution data...</Text> : null}
+          {loadError ? <Text style={styles.error}>{loadError}</Text> : null}
+          {actionMsg ? <Text style={styles.info}>{actionMsg}</Text> : null}
 
-          {viewMode === 'batch' ? (
-            <>
-              <Text style={styles.sectionTitle}>Thermal Assignment Queue</Text>
-              {thermalAssignmentQueue.length === 0 ? (
-                <View style={styles.emptyCard}>
-                  <Text style={styles.emptyTitle}>No Batches Awaiting Assignment</Text>
-                  <Text style={styles.emptySub}>RTC-marked ready batches appear here for thermal smokehouse assignment.</Text>
-                </View>
-              ) : (
-                thermalAssignmentQueue.map((ticket) => {
-                  const rtcRackCount = ticket.rtcReadyRackCount ?? ticket.racks;
-                  const thermalRackCount = assignmentRackCounts[ticket.id] ?? rtcRackCount;
+          <Text style={styles.sectionTitle}>Chiller Capacity Strip (4–16)</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.stripRow}>
+            {chillerStrip.map((c) => (
+              <View key={c.name} style={[styles.stripCard, c.overload && styles.stripOverload]}>
+                <Text style={styles.stripName}>{c.name.replace('Chiller ', 'CH-')}</Text>
+                <Text style={styles.stripValue}>{c.load}/{c.cap} racks</Text>
+                <Text style={styles.stripState}>{c.overload ? 'OVERLOAD' : c.item?.status || 'idle'}</Text>
+              </View>
+            ))}
+          </ScrollView>
 
-                  return (
-                    <C3SCard key={ticket.id} borderColor="#42A5F5">
-                      <View style={styles.topRow}>
-                        <View>
-                          <Text style={styles.product}>{ticket.product}</Text>
-                          <Text style={styles.batchId}>{ticket.id}</Text>
-                        </View>
-                        <View style={styles.queuePill}>
-                          <Text style={styles.queuePillText}>Awaiting Assignment</Text>
-                        </View>
-                      </View>
-                  <View style={styles.metaRow}>
-                    <Text style={styles.metaLabel}>Stage</Text>
-                    <Text style={styles.metaValue}>{getPrepStageDisplayLabel(ticket.status)}</Text>
-                    <Text style={styles.metaLabel}>Owner</Text>
-                    <Text style={styles.metaValue}>Thermal</Text>
-                  </View>
-                  <View style={styles.metaRow}>
-                    <Text style={styles.metaLabel}>Location</Text>
-                    <Text style={styles.metaValue}>Staging Area</Text>
-                    <Text style={styles.metaLabel}>RTC Rack Count</Text>
-                    <Text style={styles.metaValue}>{rtcRackCount}</Text>
-                    <Text style={styles.metaLabel}>Thermal Confirmed</Text>
-                    <Text style={styles.metaValue}>{thermalRackCount}</Text>
-                  </View>
-                      <View style={styles.rackAdjustRow}>
-                        <Pressable
-                          style={styles.adjustButton}
-                          onPress={() => adjustAssignmentRacks(ticket.id, rtcRackCount, -1)}>
-                          <Text style={styles.adjustButtonText}>-</Text>
+          <Text style={styles.sectionTitle}>Awaiting Chiller Assignment</Text>
+          {awaitingAssignment.length === 0 ? <Empty text="No items awaiting chiller assignment." /> : null}
+          {awaitingAssignment.map((log) => {
+            const prep = prepById[log.prepId] ?? null;
+            return (
+              <C3SCard key={log.id} borderColor="#42A5F5">
+                <Text style={styles.itemTitle}>{prepNameFrom(log, prep)}</Text>
+                <Meta label="Racks / Cases" value={`${log.racks ?? prep?.racks ?? '—'} / ${prep?.cases ?? '—'}`} />
+                <Meta label="Source Smokehouse" value={prep?.assignedSmokehouse ?? '—'} />
+                <Meta label="Cook Complete Time" value={fmtTs(prep?.evacuationCompletedAt?.toMillis?.())} />
+                <Meta label="Expected Chill Time" value={prep?.expectedChillMinutes != null ? `${prep.expectedChillMinutes} min` : '—'} />
+                <View style={styles.rowAction}>
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
+                    {chillers.map((c) => {
+                      const selected = selectedChillerByLogId[log.id] === c.id;
+                      return (
+                        <Pressable key={c.id} style={[styles.chip, selected && styles.chipActive]} onPress={() => setSelectedChillerByLogId((m) => ({ ...m, [log.id]: c.id }))}>
+                          <Text style={[styles.chipText, selected && styles.chipTextActive]}>{c.name}</Text>
                         </Pressable>
-                        <Pressable
-                          style={styles.adjustButton}
-                          onPress={() => adjustAssignmentRacks(ticket.id, rtcRackCount, 1)}>
-                          <Text style={styles.adjustButtonText}>+</Text>
-                        </Pressable>
-                      </View>
-                      <Text style={styles.nextActionLabel}>Next Action</Text>
-                      <Pressable
-                        style={styles.primaryAction}
-                        onPress={() =>
-                          confirmAction(
-                            'Assign Smokehouse',
-                            `Assign smokehouse for ${ticket.id} with ${thermalRackCount} racks?`,
-                            () => assignPrepSmokehouse(ticket.id, thermalRackCount),
-                          )
-                        }>
-                        <Text style={styles.primaryActionText}>Assign Smokehouse</Text>
-                      </Pressable>
-                    </C3SCard>
-                  );
-                })
-              )}
-
-              <Text style={styles.sectionTitle}>Thermal Live Execution</Text>
-              {thermalBatches.map((batch) => {
-                const marks = checkpointMarks[batch.id] ?? {};
-                const enabledTimelineActions = getEnabledTimelineActions(batch.id);
-                const snapshot = getCheckpointSnapshot(batch, marks);
-                const flow = getBatchFlowSnapshot(batch.id);
-
-                const stageAction =
-                  batch.stage === BATCH_STAGES.COOK && !snapshot.checkpoint50Reached
-                    ? {
-                        label: 'Mark 50F Reached',
-                        onPress: () =>
-                          confirmAction('Confirm 50F', `Confirm 50F checkpoint for ${batch.id}?`, () =>
-                            updateCheckpoint(batch.id, { fiftyReached: true }),
-                          ),
-                      }
-                    : batch.stage === BATCH_STAGES.COOK && !snapshot.checkpoint130Reached
-                      ? {
-                          label: 'Mark 130F Reached',
-                          onPress: () =>
-                            confirmAction('Confirm 130F', `Confirm 130F checkpoint for ${batch.id}?`, () =>
-                              updateCheckpoint(batch.id, { oneThirtyReached: true }),
-                            ),
-                        }
-                      : batch.stage === BATCH_STAGES.COOK && !snapshot.criticalReached
-                        ? {
-                            label: 'Confirm Critical Temp',
-                            onPress: () =>
-                              confirmAction('Confirm Critical Temp', `Confirm critical temp for ${batch.id}?`, () =>
-                                updateCheckpoint(batch.id, { criticalReached: true }),
-                              ),
-                          }
-                        : enabledTimelineActions.includes('Start Shower')
-                          ? {
-                              label: 'Start Shower',
-                              onPress: () => runTimelineAction(batch.id, 'Start Shower'),
-                            }
-                          : enabledTimelineActions.includes('Complete Shower')
-                            ? {
-                                label: 'Complete Shower',
-                                onPress: () => runTimelineAction(batch.id, 'Complete Shower'),
-                              }
-                            : enabledTimelineActions.includes('Start Chill')
-                              ? {
-                                  label: 'Move to Chill',
-                                  onPress: () => runTimelineAction(batch.id, 'Start Chill'),
-                                }
-                              : enabledTimelineActions.includes('Assign Chiller')
-                                ? {
-                                    label: 'Assign Chiller',
-                                    onPress: () => runTimelineAction(batch.id, 'Assign Chiller'),
-                                  }
-                                : enabledTimelineActions.includes('Complete Chill')
-                                  ? {
-                                      label: 'Complete Chill',
-                                      onPress: () => runTimelineAction(batch.id, 'Complete Chill'),
-                                    }
-                                  : enabledTimelineActions.includes('Send to QA')
-                                    ? {
-                                        label: 'Send to QA',
-                                        onPress: () => runTimelineAction(batch.id, 'Send to QA'),
-                                      }
-                                    : null;
-
-                return (
-                  <C3SCard key={batch.id} borderColor={snapshot.attentionItems.length > 0 ? '#C62828' : '#30363D'}>
-                    <View style={styles.topRow}>
-                      <View>
-                        <Text style={styles.product}>{batch.product}</Text>
-                        <Text style={styles.batchId}>{batch.id}</Text>
-                      </View>
-                      <View style={[styles.statusPill, { backgroundColor: BATCH_STATUS_COLORS[batch.status] }]}>
-                        <Text style={styles.statusText}>{batch.status}</Text>
-                      </View>
-                    </View>
-
-                    <View style={styles.metaRow}>
-                      <Text style={styles.metaLabel}>Smokehouse</Text>
-                      <Text style={styles.metaValue}>{batch.smokehouse}</Text>
-                      <Text style={styles.metaLabel}>Cook Type</Text>
-                      <Text style={styles.metaValue}>{batch.productProfile.cookType.toUpperCase()}</Text>
-                    </View>
-
-                    <View style={styles.metaRow}>
-                      <Text style={styles.metaLabel}>Stage</Text>
-                      <Text style={[styles.stageText, { color: STAGE_COLORS[batch.stage] }]}>{getStageDisplayLabel(batch.stage)}</Text>
-                      <Text style={styles.metaLabel}>Elapsed</Text>
-                      <Text style={styles.elapsedValue}>{snapshot.elapsedCookMinutes} min</Text>
-                    </View>
-                    <View style={styles.metaRow}>
-                      <Text style={styles.metaLabel}>Cook Expected / Elapsed</Text>
-                      <Text style={styles.metaValue}>
-                        {snapshot.expectedCookMinutes}m / {snapshot.elapsedCookMinutes}m
-                      </Text>
-                      <Text style={styles.metaLabel}>Rack Type / Expected</Text>
-                      <Text style={styles.metaValue}>
-                        {batch.productProfile.rackType} / {batch.productProfile.averageRackCount}
-                      </Text>
-                    </View>
-                    {snapshot.elapsedChillMinutes !== undefined ? (
-                      <View style={styles.metaRow}>
-                        <Text style={styles.metaLabel}>Chill Expected / Elapsed</Text>
-                        <Text style={styles.metaValue}>
-                          {batch.productProfile.estimatedChillMinutes}m / {snapshot.elapsedChillMinutes}m
-                        </Text>
-                      </View>
-                    ) : null}
-                    {flow ? (
-                      <View style={styles.metaRow}>
-                        <Text style={styles.metaLabel}>Owner</Text>
-                        <Text style={styles.metaValue}>{flow.currentOwner}</Text>
-                        <Text style={styles.metaLabel}>Location</Text>
-                        <Text style={styles.metaValue}>{flow.currentLocation}</Text>
-                      </View>
-                    ) : null}
-
-                    <View style={styles.checkpointRow}>
-                      <View style={[styles.checkpointChip, checkpointStyle(snapshot.checkpoint50Reached)]}>
-                        <Text style={styles.checkpointText}>50F</Text>
-                      </View>
-                      <View
-                        style={[
-                          styles.checkpointChip,
-                          checkpointStyle(snapshot.checkpoint130Reached, snapshot.missed130Deadline),
-                        ]}>
-                        <Text style={styles.checkpointText}>130F (6h)</Text>
-                      </View>
-                      <View style={[styles.checkpointChip, checkpointStyle(snapshot.criticalReached)]}>
-                        <Text style={styles.checkpointText}>Critical Temp</Text>
-                      </View>
-                    </View>
-
-                    {snapshot.attentionItems.length > 0 ? (
-                      <View
-                        style={[
-                          styles.attentionPanel,
-                          snapshot.attentionSeverity === 'urgent' ? styles.attentionPanelUrgent : styles.attentionPanelWarning,
-                        ]}>
-                        <Text
-                          style={[
-                            styles.attentionTitle,
-                            snapshot.attentionSeverity === 'urgent' ? styles.attentionTitleUrgent : styles.attentionTitleWarning,
-                          ]}>
-                          {snapshot.attentionHeader}
-                        </Text>
-                        {snapshot.attentionItems.map((issue) => (
-                          <Text
-                            key={issue.label}
-                            style={[
-                              styles.attentionItem,
-                              snapshot.attentionSeverity === 'urgent' ? styles.attentionItemUrgent : styles.attentionItemWarning,
-                            ]}>{`• ${issue.label}`}</Text>
-                        ))}
-                      </View>
-                    ) : null}
-
-                    <Text style={styles.nextActionLabel}>Next Action</Text>
-                    {stageAction ? (
-                      <Pressable style={styles.primaryAction} onPress={stageAction.onPress}>
-                        <Text style={styles.primaryActionText}>{stageAction.label}</Text>
-                      </Pressable>
-                    ) : (
-                      <Text style={styles.noActionText}>No stage-valid action available.</Text>
-                    )}
-                    {flow ? (
-                      <View style={styles.metaRow}>
-                        <Text style={styles.metaLabel}>Waiting On</Text>
-                        <Text style={styles.metaValue}>{flow.waitingOn}</Text>
-                      </View>
-                    ) : null}
-
-                    <View style={styles.secondaryRow}>
-                      <Pressable
-                        style={styles.secondaryAction}
-                        onPress={() =>
-                          confirmAction('Flag Issue', `Flag monitoring issue for ${batch.id}?`, () =>
-                            updateCheckpoint(batch.id, { issueFlagged: true }),
-                          )
-                        }>
-                        <Text style={styles.secondaryActionText}>Flag Issue</Text>
-                      </Pressable>
-                      <Pressable
-                        style={styles.secondaryAction}
-                        onPress={() => router.push({ pathname: '/batch-timeline', params: { batchId: batch.id } })}>
-                        <Text style={styles.secondaryActionText}>View Details</Text>
-                      </Pressable>
-                    </View>
-                  </C3SCard>
-                );
-              })}
-
-              {thermalBatches.length === 0 ? (
-                <View style={styles.emptyCard}>
-                  <Text style={styles.emptyTitle}>No Active Thermal Batches</Text>
-                  <Text style={styles.emptySub}>Batches will appear here once loaded into thermal flow.</Text>
+                      );
+                    })}
+                  </ScrollView>
+                  <Pressable style={styles.primaryBtn} disabled={workingId === log.id} onPress={() => onAssign(log)}>
+                    <Text style={styles.primaryBtnText}>{workingId === log.id ? 'Assigning...' : 'Assign Chiller'}</Text>
+                  </Pressable>
                 </View>
-              ) : null}
-            </>
-          ) : (
-            <>
-              <Text style={styles.sectionTitle}>Smokehouses</Text>
-              {smokehouseRows.map((smokehouse) => (
-                <Pressable
-                  key={smokehouse.smokehouseId}
-                  style={styles.equipmentCard}
-                  onPress={() =>
-                    smokehouse.loadedBatch
-                      ? router.push({ pathname: '/batch-timeline', params: { batchId: smokehouse.loadedBatch.id } })
-                      : undefined
-                  }>
-                  <View style={styles.topRow}>
-                    <View>
-                      <Text style={styles.product}>{`Smokehouse ${smokehouse.smokehouseId}`}</Text>
-                      <Text style={styles.batchId}>
-                        {smokehouse.loadedBatch
-                          ? `${smokehouse.loadedBatch.product} · ${getStageDisplayLabel(smokehouse.loadedBatch.stage)}`
-                          : 'No active load'}
-                      </Text>
-                    </View>
-                    <View style={styles.queuePill}>
-                      <Text style={styles.queuePillText}>{smokehouse.status}</Text>
-                    </View>
-                  </View>
-                  {smokehouse.loadedBatch ? (
-                    <View style={styles.metaRow}>
-                      <Text style={styles.metaLabel}>Elapsed</Text>
-                      <Text style={styles.metaValue}>{smokehouse.elapsedMinutes} min</Text>
-                      <Text style={styles.metaLabel}>Waiting On</Text>
-                      <Text style={styles.metaValue}>{smokehouse.nextCheckpoint}</Text>
-                    </View>
-                  ) : null}
-                </Pressable>
-              ))}
+              </C3SCard>
+            );
+          })}
 
-              <Text style={styles.sectionTitle}>Chillers</Text>
-              {chillerRows.map((chiller) => (
-                <Pressable
-                  key={chiller.chillerId}
-                  style={styles.equipmentCard}
-                  onPress={() =>
-                    chiller.occupiedBatch
-                      ? router.push({ pathname: '/batch-timeline', params: { batchId: chiller.occupiedBatch.id } })
-                      : undefined
-                  }>
-                  <View style={styles.topRow}>
-                    <View>
-                      <Text style={styles.product}>{chiller.chillerId}</Text>
-                      <Text style={styles.batchId}>{chiller.occupiedBatch ? chiller.occupiedBatch.product : 'No occupied batch'}</Text>
-                    </View>
-                    <View style={styles.queuePill}>
-                      <Text style={styles.queuePillText}>{chiller.status}</Text>
-                    </View>
-                  </View>
-                  {chiller.occupiedBatch ? (
-                    <View style={styles.metaRow}>
-                      <Text style={styles.metaLabel}>Time in Chill</Text>
-                      <Text style={styles.metaValue}>{chiller.timeInChill ?? 0} min</Text>
-                      <Text style={styles.metaLabel}>Waiting On</Text>
-                      <Text style={styles.metaValue}>{chiller.nextCheck ?? 'Monitor'}</Text>
-                    </View>
-                  ) : null}
-                </Pressable>
-              ))}
-            </>
-          )}
+          <Text style={styles.sectionTitle}>Chill Running</Text>
+          {running.length === 0 ? <Empty text="No products currently chilling." /> : null}
+          {running.map((log) => {
+            const prep = prepById[log.prepId] ?? null;
+            const assignedChiller = log.chillerId ? chillers.find((c) => c.id === log.chillerId)?.name : '—';
+            const startMs = log.createdAt?.toMillis?.();
+            const expectedEnd = prep?.expectedChillMinutes && startMs
+              ? new Date(startMs + prep.expectedChillMinutes * 60000).toLocaleString()
+              : '—';
+            const nextCheck = log.timeTo50F == null ? 'Record 50°F milestone' : log.timeTo40F == null ? 'Record 40°F milestone' : 'Checks complete';
+            return (
+              <C3SCard key={log.id} borderColor="#29B6F6">
+                <Text style={styles.itemTitle}>{prepNameFrom(log, prep)}</Text>
+                <Meta label="Assigned Chiller" value={assignedChiller || '—'} />
+                <Meta label="Chill Start" value={fmtTs(startMs)} />
+                <Meta label="Elapsed" value={elapsedText(startMs)} />
+                <Meta label="Expected Chill Complete" value={expectedEnd} />
+                <Meta label="Next Required Check" value={nextCheck} />
+                <View style={styles.rowAction}>
+                  <TextInput
+                    style={styles.input}
+                    value={signoutTempByLogId[log.id] ?? ''}
+                    onChangeText={(v) => setSignoutTempByLogId((m) => ({ ...m, [log.id]: v }))}
+                    placeholder="Sign-out temp °F"
+                    placeholderTextColor="#6E7681"
+                    keyboardType="numeric"
+                  />
+                  <Pressable style={styles.primaryBtn} disabled={workingId === log.id} onPress={() => onSendToQa(log)}>
+                    <Text style={styles.primaryBtnText}>{workingId === log.id ? 'Saving...' : 'Send to QA'}</Text>
+                  </Pressable>
+                </View>
+              </C3SCard>
+            );
+          })}
+
+          <Text style={styles.sectionTitle}>Chill Check Due</Text>
+          {checkDue.length === 0 ? <Empty text="No chill checks currently due." /> : null}
+          {checkDue.map((log) => {
+            const prep = prepById[log.prepId] ?? null;
+            const defaultType: '50' | '40' = log.timeTo50F == null ? '50' : '40';
+            const selectedType = checkTypeByLogId[log.id] ?? defaultType;
+            return (
+              <C3SCard key={`due-${log.id}`} borderColor="#FFA726">
+                <Text style={styles.itemTitle}>{prepNameFrom(log, prep)}</Text>
+                <Meta label="Target/Check" value={selectedType === '50' ? '50°F milestone' : '40°F milestone'} />
+                <View style={styles.rowAction}>
+                  <Pressable style={[styles.chip, selectedType === '50' && styles.chipActive]} onPress={() => setCheckTypeByLogId((m) => ({ ...m, [log.id]: '50' }))}>
+                    <Text style={[styles.chipText, selectedType === '50' && styles.chipTextActive]}>50°F</Text>
+                  </Pressable>
+                  <Pressable style={[styles.chip, selectedType === '40' && styles.chipActive]} onPress={() => setCheckTypeByLogId((m) => ({ ...m, [log.id]: '40' }))}>
+                    <Text style={[styles.chipText, selectedType === '40' && styles.chipTextActive]}>40°F</Text>
+                  </Pressable>
+                  <TextInput
+                    style={styles.input}
+                    value={checkMinutesByLogId[log.id] ?? ''}
+                    onChangeText={(v) => setCheckMinutesByLogId((m) => ({ ...m, [log.id]: v }))}
+                    placeholder="Minutes"
+                    placeholderTextColor="#6E7681"
+                    keyboardType="numeric"
+                  />
+                  <Pressable style={styles.primaryBtn} disabled={workingId === log.id} onPress={() => onRecordCheck(log)}>
+                    <Text style={styles.primaryBtnText}>{workingId === log.id ? 'Saving...' : 'Record Chill Check'}</Text>
+                  </Pressable>
+                </View>
+              </C3SCard>
+            );
+          })}
+
+          <Text style={styles.sectionTitle}>Ready for QA</Text>
+          {readyForQa.length === 0 ? <Empty text="No products waiting for QA." /> : null}
+          {readyForQa.map((q) => (
+            <C3SCard key={q.id} borderColor="#66BB6A">
+              <Text style={styles.itemTitle}>{q.productName || q.prepId || '—'}</Text>
+              <Meta label="Status" value="Ready for QA" />
+              <Meta label="Timestamp" value={fmtTs(q.timestamp?.toMillis?.())} />
+              <Pressable style={styles.secondaryBtn} onPress={() => router.push('/qa-review')}>
+                <Text style={styles.secondaryBtnText}>Go to QA / Mark Ready for QA</Text>
+              </Pressable>
+            </C3SCard>
+          ))}
+
+          <Text style={styles.sectionTitle}>Hold / Deviation</Text>
+          {holdDeviation.length === 0 ? <Empty text="No chill hold/deviation items." /> : null}
+          {holdDeviation.map((log) => (
+            <C3SCard key={`hold-${log.id}`} borderColor="#EF5350">
+              <Text style={styles.itemTitle}>{log.productName || log.prepId || '—'}</Text>
+              <Meta label="Reason" value={log.deviationReason || log.deviationNotes || '—'} />
+              <Meta label="Timestamp" value={fmtTs(log.deviationAt?.toMillis?.())} />
+              <Pressable style={styles.secondaryBtn} disabled={workingId === log.id} onPress={() => onFlagDeviation(log)}>
+                <Text style={styles.secondaryBtnText}>{workingId === log.id ? 'Saving...' : 'Re-Flag Deviation'}</Text>
+              </Pressable>
+            </C3SCard>
+          ))}
         </ScrollView>
       </C3SPage>
     </C3SScreen>
   );
 }
 
+function Meta({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.metaRow}>
+      <Text style={styles.metaLabel}>{label}</Text>
+      <Text style={styles.metaValue}>{value || '—'}</Text>
+    </View>
+  );
+}
+
+function Empty({ text }: { text: string }) {
+  return (
+    <View style={styles.emptyCard}>
+      <Text style={styles.emptyText}>{text}</Text>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  listContent: {
-    gap: 10,
-    paddingBottom: 24,
-  },
-  viewToggleRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  viewToggleButton: {
-    flex: 1,
-    minHeight: 40,
-    borderRadius: 10,
+  content: { gap: 8, paddingBottom: 24 },
+  refreshBtn: {
     borderWidth: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 12,
-  },
-  viewToggleActive: {
-    borderColor: '#42A5F5',
-    backgroundColor: '#143A5E',
-  },
-  viewToggleInactive: {
     borderColor: '#30363D',
     backgroundColor: '#151A21',
-  },
-  viewToggleText: {
-    color: '#9DA7B1',
-    fontSize: 13,
-    fontWeight: '800',
-  },
-  viewToggleTextActive: {
-    color: '#E3F2FD',
-  },
-  sectionTitle: {
-    color: '#E6EDF3',
-    fontSize: 18,
-    fontWeight: '800',
-    marginTop: 2,
-  },
-  topRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    gap: 10,
-  },
-  product: {
-    color: '#F0F6FC',
-    fontSize: 20,
-    fontWeight: '800',
-  },
-  batchId: {
-    color: '#9DA7B1',
-    fontSize: 13,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  statusPill: {
-    borderRadius: 999,
+    borderRadius: 8,
     paddingHorizontal: 10,
-    paddingVertical: 4,
+    paddingVertical: 6,
   },
-  statusText: {
-    color: '#0D1117',
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  queuePill: {
-    borderRadius: 999,
+  refreshText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
+  sectionTitle: { color: '#8AB4F8', fontSize: 13, fontWeight: '800', marginTop: 4 },
+  stripRow: { gap: 6 },
+  stripCard: {
     borderWidth: 1,
-    borderColor: '#42A5F5',
-    backgroundColor: '#143A5E',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
+    borderColor: '#30363D',
+    backgroundColor: '#151A21',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    minWidth: 90,
   },
-  queuePillText: {
-    color: '#E3F2FD',
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  metaRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'center',
-    gap: 8,
-    marginTop: 8,
-  },
-  metaLabel: {
-    color: '#8B949E',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  metaValue: {
-    color: '#E6EDF3',
-    fontSize: 13,
-    fontWeight: '700',
-    marginRight: 10,
-  },
-  stageText: {
-    fontSize: 18,
-    fontWeight: '800',
-    marginRight: 10,
-  },
-  elapsedValue: {
-    color: '#E6EDF3',
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  checkpointRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 10,
-  },
-  checkpointChip: {
+  stripOverload: { borderColor: '#C62828', backgroundColor: '#2A1414' },
+  stripName: { color: '#E6EDF3', fontSize: 11, fontWeight: '800' },
+  stripValue: { color: '#AAB4BE', fontSize: 11 },
+  stripState: { color: '#8B949E', fontSize: 10 },
+  itemTitle: { color: '#E6EDF3', fontSize: 13, fontWeight: '800', marginBottom: 4 },
+  metaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8, marginBottom: 2 },
+  metaLabel: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
+  metaValue: { color: '#C9D1D9', fontSize: 11, fontWeight: '600' },
+  rowAction: { flexDirection: 'row', gap: 6, alignItems: 'center', marginTop: 6, flexWrap: 'wrap' },
+  chips: { gap: 4 },
+  chip: {
     borderWidth: 1,
+    borderColor: '#30363D',
+    backgroundColor: '#0D1117',
     borderRadius: 999,
-    paddingHorizontal: 12,
+    paddingHorizontal: 8,
     paddingVertical: 5,
   },
-  checkpointText: {
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  attentionPanel: {
-    marginTop: 10,
-    borderRadius: 10,
-    padding: 8,
-    gap: 2,
-  },
-  attentionPanelWarning: {
-    borderWidth: 1,
-    borderColor: '#F9A825',
-    backgroundColor: '#332710',
-  },
-  attentionPanelUrgent: {
-    borderWidth: 1,
-    borderColor: '#C62828',
-    backgroundColor: '#2E1414',
-  },
-  attentionTitle: {
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  attentionTitleWarning: {
-    color: '#FFE082',
-  },
-  attentionTitleUrgent: {
-    color: '#FFCDD2',
-  },
-  attentionItem: {
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  attentionItemWarning: {
-    color: '#FFE0B2',
-  },
-  attentionItemUrgent: {
-    color: '#FFCDD2',
-  },
-  nextActionLabel: {
-    color: '#9DA7B1',
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 10,
-    marginBottom: 4,
-  },
-  primaryAction: {
-    minHeight: 46,
-    borderRadius: 10,
-    backgroundColor: '#1565C0',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 12,
-  },
-  primaryActionText: {
-    color: '#F0F6FC',
-    fontSize: 14,
-    fontWeight: '800',
-    textAlign: 'center',
-  },
-  noActionText: {
-    color: '#9DA7B1',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  secondaryRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 8,
-  },
-  rackAdjustRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 8,
-  },
-  adjustButton: {
-    minHeight: 34,
-    minWidth: 44,
-    borderRadius: 8,
+  chipActive: { borderColor: '#2F6D8A', backgroundColor: '#13314A' },
+  chipText: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
+  chipTextActive: { color: '#CDE8FF' },
+  input: {
+    minWidth: 90,
     borderWidth: 1,
     borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  adjustButtonText: {
+    backgroundColor: '#0D1117',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
     color: '#E6EDF3',
-    fontSize: 16,
-    fontWeight: '800',
+    fontSize: 12,
   },
-  secondaryAction: {
-    minHeight: 36,
-    borderRadius: 8,
+  primaryBtn: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    alignItems: 'center',
-    justifyContent: 'center',
+    borderColor: '#2F6D8A',
+    backgroundColor: '#13314A',
+    borderRadius: 8,
     paddingHorizontal: 10,
+    paddingVertical: 7,
   },
-  secondaryActionText: {
-    color: '#E6EDF3',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  equipmentCard: {
+  primaryBtnText: { color: '#E6EDF3', fontSize: 11, fontWeight: '700' },
+  secondaryBtn: {
+    marginTop: 6,
     borderWidth: 1,
-    borderColor: '#30363D',
-    borderRadius: 12,
-    backgroundColor: '#151A21',
-    padding: 14,
+    borderColor: '#455A64',
+    backgroundColor: '#1A2430',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    alignSelf: 'flex-start',
   },
+  secondaryBtnText: { color: '#C9D1D9', fontSize: 11, fontWeight: '700' },
   emptyCard: {
     borderWidth: 1,
     borderColor: '#30363D',
-    borderRadius: 12,
+    borderRadius: 8,
     backgroundColor: '#151A21',
-    padding: 14,
+    padding: 10,
   },
-  emptyTitle: {
-    color: '#E6EDF3',
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  emptySub: {
-    color: '#9DA7B1',
-    fontSize: 13,
-    fontWeight: '600',
-    marginTop: 3,
-  },
+  emptyText: { color: '#8B949E', fontSize: 12 },
+  info: { color: '#8B949E', fontSize: 12 },
+  error: { color: '#FF7B72', fontSize: 12, fontWeight: '700' },
 });

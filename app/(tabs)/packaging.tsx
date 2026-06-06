@@ -1,571 +1,430 @@
-import { useMemo, useState } from 'react';
-import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useMemo, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 
-import { C3SBlockedChips, C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
-import { BATCH_STATUSES, RTE_COOLER, getStageDisplayLabel } from '@/constants/c3s';
-import { type PackagingLineId, type SlicingLineId, type WorkflowState, useC3S } from '@/store/c3s-store';
+import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import {
+  getChillLogs,
+  getPackagingLogs,
+  getPrepQueueItems,
+  getQAChecks,
+  type ChillLogItem,
+  type PackagingLogItem,
+  type PrepQueueItem,
+  type QACheckItem,
+} from '@/lib/firebase/repository';
+import { logFirebaseError, toOperatorMessage } from '@/lib/auth/diagnostics';
+import {
+  getOperationalItems,
+  oItemAppendPackagingNote,
+  oItemCompletePackaging,
+  oItemHoldPackaging,
+  oItemResumePackaging,
+  oItemStartPackaging,
+  type OItemItem,
+} from '@/lib/operational-items';
 
-type FilterKey = 'all' | 'next2' | 'next4';
-
-type SelectedAsset =
-  | { kind: 'slicing'; id: SlicingLineId }
-  | { kind: 'packaging'; id: PackagingLineId }
-  | null;
-
-const filters: { key: FilterKey; label: string }[] = [
-  { key: 'all', label: 'All Queue' },
-  { key: 'next2', label: 'Next 2 Hours' },
-  { key: 'next4', label: 'Next 4 Hours' },
-];
-
-const workflowColors: Record<WorkflowState, string> = {
-  ready: '#66BB6A',
-  waiting: '#4FC3F7',
-  blocked: '#EF5350',
-  assigned: '#AB47BC',
-  running: '#FFA726',
-};
-
-function formatLineType(type: string) {
-  if (type === 'combo') return 'Combo';
-  if (type === 'standard') return 'Standard';
-  if (type === 'slicing') return 'Slicing';
-  return type;
+function fmtTs(ms?: number) {
+  if (!ms || !Number.isFinite(ms)) return '—';
+  return new Date(ms).toLocaleString();
 }
-function hashFromText(value: string) {
-  return value.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+
+function elapsedText(startMs?: number, endMs?: number) {
+  if (!startMs || !Number.isFinite(startMs)) return '—';
+  const to = endMs && Number.isFinite(endMs) ? endMs : Date.now();
+  const m = Math.floor((to - startMs) / 60000);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
 export default function PackagingScreen() {
-  const {
-    batches,
-    rteCooler,
-    slicingLines,
-    packagingLines,
-    markSlicingLineClean,
-    setSlicingLineQAPreOp,
-    markSlicingLineReady,
-    assignBatchToSlicingLine,
-    markPackagingLineClean,
-    setPackagingLineQAPreOp,
-    markPackagingLineReady,
-    assignBatchToPackagingLine,
-    getBatchHandoffLabel,
-    getBatchBlockedReasons,
-    getBatchWorkflowState,
-    getBatchFlowSnapshot,
-    canViewBatchInArea,
-  } = useC3S();
+  const [oItems, setOItems] = useState<OItemItem[]>([]);
+  const [qaChecks, setQaChecks] = useState<QACheckItem[]>([]);
+  const [preps, setPreps] = useState<PrepQueueItem[]>([]);
+  const [chillLogs, setChillLogs] = useState<ChillLogItem[]>([]);
+  const [packagingLogs, setPackagingLogs] = useState<PackagingLogItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [workingId, setWorkingId] = useState<string | null>(null);
 
-  const [selected, setSelected] = useState<SelectedAsset>(null);
-  const [activeFilter, setActiveFilter] = useState<FilterKey>('all');
+  const [holdReasonByLogId, setHoldReasonByLogId] = useState<Record<string, string>>({});
+  const [noteByLogId, setNoteByLogId] = useState<Record<string, string>>({});
+  const [casesByLogId, setCasesByLogId] = useState<Record<string, string>>({});
+  const [unitsByLogId, setUnitsByLogId] = useState<Record<string, string>>({});
 
-  const waitingInRTE = useMemo(
-    () =>
-      batches.filter(
-        (batch) =>
-          canViewBatchInArea('packaging', batch.id) &&
-          batch.packagingStatus === 'Waiting' &&
-          batch.rteCoolerId === RTE_COOLER,
-      ),
-    [batches, canViewBatchInArea],
-  );
-
-  const assignedBatches = useMemo(
-    () =>
-      batches.filter(
-        (batch) =>
-          canViewBatchInArea('packaging', batch.id) &&
-          (batch.packagingStatus === 'Assigned' || batch.slicingStatus === 'Assigned'),
-      ),
-    [batches, canViewBatchInArea],
-  );
-
-  const runningBatches = useMemo(
-    () => batches.filter((batch) => canViewBatchInArea('packaging', batch.id) && batch.packagingStatus === 'Running'),
-    [batches, canViewBatchInArea],
-  );
-
-  const delayedBatches = useMemo(
-    () => batches.filter((batch) => canViewBatchInArea('packaging', batch.id) && batch.status === BATCH_STATUSES.DELAYED),
-    [batches, canViewBatchInArea],
-  );
-
-  const lineIssuesCount = useMemo(() => {
-    const slicingIssues = slicingLines.filter(
-      (line) => !line.cleanStatus || !line.ready || line.qaPreOpStatus !== 'Passed',
-    ).length;
-    const packagingIssues = packagingLines.filter(
-      (line) => !line.cleanStatus || !line.readyStatus || line.qaPreOpStatus !== 'Passed',
-    ).length;
-    const coolerIssue = !rteCooler.cleanStatus || !rteCooler.readyStatus || rteCooler.qaPreOpStatus !== 'Passed' ? 1 : 0;
-    return slicingIssues + packagingIssues + coolerIssue;
-  }, [slicingLines, packagingLines, rteCooler]);
-
-  const queueCandidates = useMemo(
-    () =>
-      batches.filter(
-        (batch) =>
-          canViewBatchInArea('packaging', batch.id) &&
-          (batch.packagingStatus === 'Waiting' || batch.packagingStatus === 'Assigned' || batch.packagingStatus === 'Running'),
-      ),
-    [batches, canViewBatchInArea],
-  );
-
-  const queue = useMemo(() => {
-    if (activeFilter === 'next2') {
-      return queueCandidates.filter((batch) => batch.minutesToReady > 0 && batch.minutesToReady <= 120);
+  const load = useCallback(async () => {
+    setIsLoading(true);
+    setLoadError(null);
+    const results = await Promise.allSettled([
+      getOperationalItems(),
+      getQAChecks(),
+      getPrepQueueItems(),
+      getChillLogs(),
+      getPackagingLogs(),
+    ]);
+    const [oR, qR, pR, chR, logsR] = results;
+    if (oR.status === 'fulfilled') setOItems(oR.value);
+    if (qR.status === 'fulfilled') setQaChecks(qR.value);
+    if (pR.status === 'fulfilled') setPreps(pR.value);
+    if (chR.status === 'fulfilled') setChillLogs(chR.value);
+    if (logsR.status === 'fulfilled') setPackagingLogs(logsR.value);
+    const firstFail = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+    if (firstFail) {
+      logFirebaseError('Packaging', 'operational_items/qa_checks/prep_queue/chill_logs/packaging_logs', firstFail.reason);
+      setLoadError(toOperatorMessage(firstFail.reason, 'Failed to load packaging data.'));
     }
-    if (activeFilter === 'next4') {
-      return queueCandidates.filter((batch) => batch.minutesToReady > 0 && batch.minutesToReady <= 240);
+    setIsLoading(false);
+  }, []);
+
+  useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  const prepById = useMemo(
+    () => preps.reduce<Record<string, PrepQueueItem>>((map, p) => { map[p.id] = p; return map; }, {}),
+    [preps],
+  );
+
+  const chillById = useMemo(
+    () => chillLogs.reduce<Record<string, ChillLogItem>>((map, c) => { map[c.id] = c; return map; }, {}),
+    [chillLogs],
+  );
+
+  const packagingStageItems = useMemo(
+    () => oItems.filter(
+      (item) =>
+        item.stage === 'packaging' ||
+        item.status === 'ready_for_packaging' ||  // stage='qa' but cleared by QA — ready to package
+        item.status === 'packaging_complete' ||
+        item.status === 'complete',
+    ),
+    [oItems],
+  );
+
+  const readyForPackaging = useMemo(
+    () => packagingStageItems.filter((item) => item.status === 'ready_for_packaging'),
+    [packagingStageItems],
+  );
+
+  const inProgress = useMemo(
+    () => packagingStageItems.filter((item) => item.status === 'packaging_in_progress'),
+    [packagingStageItems],
+  );
+
+  const packaged = useMemo(
+    () => packagingStageItems.filter((item) => item.status === 'packaging_complete' || item.status === 'complete'),
+    [packagingStageItems],
+  );
+
+  const holdDelay = useMemo(
+    () => packagingStageItems.filter((item) => item.packagingLogStatus === 'deviation' || item.hasDeviation),
+    [packagingStageItems],
+  );
+
+  async function onStartPackaging(item: OItemItem) {
+    if (!item.qaCheckId) {
+      setActionMsg('Missing QA check linkage.');
+      return;
     }
-    return queueCandidates;
-  }, [activeFilter, queueCandidates]);
-
-  const selectedSlicing = selected?.kind === 'slicing' ? slicingLines.find((line) => line.id === selected.id) : undefined;
-  const selectedPackaging =
-    selected?.kind === 'packaging' ? packagingLines.find((line) => line.id === selected.id) : undefined;
-  const selectedBatchId = selectedSlicing?.assignedBatchId ?? selectedPackaging?.assignedBatchId;
-  const selectedBatch = selectedBatchId ? batches.find((batch) => batch.id === selectedBatchId) : undefined;
-  const selectedPrimaryAction = useMemo(() => {
-    if (!selected) return null;
-
-    if (selected.kind === 'slicing' && selectedSlicing) {
-      if (!selectedSlicing.cleanStatus) {
-        return { label: 'Mark Clean', onPress: () => markSlicingLineClean(selectedSlicing.id) };
-      }
-      if (selectedSlicing.qaPreOpStatus !== 'Passed') {
-        return {
-          label: 'Mark QA Pre-Op Passed',
-          onPress: () => setSlicingLineQAPreOp(selectedSlicing.id, 'Passed'),
-        };
-      }
-      if (!selectedSlicing.ready) {
-        return { label: 'Mark Ready', onPress: () => markSlicingLineReady(selectedSlicing.id) };
-      }
-      return {
-        label: selectedSlicing.assignedBatchId ? 'Complete Slicing Run' : 'Assign Batch',
-        onPress: () => assignBatchToSlicingLine(selectedSlicing.id),
-      };
+    try {
+      setWorkingId(item.id);
+      await oItemStartPackaging(item.id, item.stage, item.status, item.qaCheckId);
+      setActionMsg(`Started packaging for ${item.productName || item.id}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to start packaging.'));
+    } finally {
+      setWorkingId(null);
     }
+  }
 
-    if (selected.kind === 'packaging' && selectedPackaging) {
-      if (!selectedPackaging.cleanStatus) {
-        return { label: 'Mark Clean', onPress: () => markPackagingLineClean(selectedPackaging.id) };
-      }
-      if (selectedPackaging.qaPreOpStatus !== 'Passed') {
-        return {
-          label: 'Mark QA Pre-Op Passed',
-          onPress: () => setPackagingLineQAPreOp(selectedPackaging.id, 'Passed'),
-        };
-      }
-      if (!selectedPackaging.readyStatus) {
-        return { label: 'Mark Ready', onPress: () => markPackagingLineReady(selectedPackaging.id) };
-      }
-      const lineBatch = selectedPackaging.assignedBatchId
-        ? batches.find((batch) => batch.id === selectedPackaging.assignedBatchId)
-        : undefined;
-      const lineActionLabel =
-        lineBatch?.packagingStatus === 'Assigned'
-          ? 'Start Packaging Run'
-          : lineBatch?.packagingStatus === 'Running'
-            ? 'Complete Packaging Run'
-            : 'Assign Batch';
-      return {
-        label: lineActionLabel,
-        onPress: () => assignBatchToPackagingLine(selectedPackaging.id),
-      };
+  async function onMarkPackaged(item: OItemItem) {
+    const cases = Number(casesByLogId[item.id] ?? '1');
+    const units = Number(unitsByLogId[item.id] ?? '1');
+    if (!item.packagingLogId) {
+      setActionMsg('Missing packaging log linkage.');
+      return;
     }
+    if (!Number.isFinite(cases) || cases <= 0 || !Number.isFinite(units) || units <= 0) {
+      setActionMsg('Cases/units must be positive numbers.');
+      return;
+    }
+    try {
+      setWorkingId(item.id);
+      await oItemCompletePackaging(item.id, item.stage, item.status, item.packagingLogId, {
+        casesProduced: cases,
+        unitsProduced: units,
+        yieldPercent: null,
+        notes: noteByLogId[item.id] ?? '',
+        packagingLine: '',
+        packagedBy: 'Packaging Operator',
+      });
+      setActionMsg(`Marked packaged: ${item.productName}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to mark packaged.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
 
-    return null;
-  }, [
-    selected,
-    selectedPackaging,
-    selectedSlicing,
-    batches,
-    markSlicingLineClean,
-    setSlicingLineQAPreOp,
-    markSlicingLineReady,
-    assignBatchToSlicingLine,
-    markPackagingLineClean,
-    setPackagingLineQAPreOp,
-    markPackagingLineReady,
-    assignBatchToPackagingLine,
-  ]);
+  async function onPlaceHold(item: OItemItem) {
+    const reason = (holdReasonByLogId[item.id] ?? '').trim();
+    if (!item.packagingLogId) {
+      setActionMsg('Missing packaging log linkage.');
+      return;
+    }
+    if (!reason) {
+      setActionMsg('Hold reason is required.');
+      return;
+    }
+    try {
+      setWorkingId(item.id);
+      await oItemHoldPackaging(item.id, item.packagingLogId, reason);
+      setActionMsg(`Placed hold on ${item.productName}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to place hold.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
+
+  async function onResume(item: OItemItem) {
+    if (!item.packagingLogId) {
+      setActionMsg('Missing packaging log linkage.');
+      return;
+    }
+    try {
+      setWorkingId(item.id);
+      await oItemResumePackaging(item.id, item.packagingLogId);
+      setActionMsg(`Resumed packaging for ${item.productName}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to resume packaging.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
+
+  async function onUpdateNote(item: OItemItem) {
+    const note = (noteByLogId[item.id] ?? '').trim();
+    if (!item.packagingLogId) {
+      setActionMsg('Missing packaging log linkage.');
+      return;
+    }
+    if (!note) {
+      setActionMsg('Note is required.');
+      return;
+    }
+    try {
+      setWorkingId(item.id);
+      await oItemAppendPackagingNote(item.id, item.packagingLogId, note);
+      setActionMsg(`Updated note for ${item.productName}.`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to update note.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
 
   return (
     <C3SScreen>
       <C3SPage>
         <C3SScreenHeader
-          title="Packaging Operations"
-          subtitle={`Batch-first packaging flow with RTE Cooler ${RTE_COOLER} and line readiness`}
+          title="Packaging"
+          subtitle={`Ready for Packaging: ${readyForPackaging.length}`}
+          right={<Pressable style={styles.refreshBtn} onPress={load}><Text style={styles.refreshText}>Refresh</Text></Pressable>}
         />
 
-        <View style={styles.kpiRow}>
-          {[
-            { label: 'Waiting in RTE', value: waitingInRTE.length },
-            { label: 'Assigned', value: assignedBatches.length },
-            { label: 'Running', value: runningBatches.length },
-            { label: 'Delayed', value: delayedBatches.length },
-            { label: 'Line Issues', value: lineIssuesCount },
-          ].map((kpi) => (
-            <View key={kpi.label} style={styles.kpiCard}>
-              <Text style={styles.kpiValue}>{kpi.value}</Text>
-              <Text style={styles.kpiLabel}>{kpi.label}</Text>
-            </View>
-          ))}
-        </View>
+        <ScrollView contentContainerStyle={styles.content}>
+          {isLoading ? <Text style={styles.info}>Loading packaging execution data...</Text> : null}
+          {loadError ? <Text style={styles.error}>{loadError}</Text> : null}
+          {actionMsg ? <Text style={styles.info}>{actionMsg}</Text> : null}
 
-        <Text style={styles.sectionTitle}>RTE Cooler</Text>
-        <C3SCard>
-          <View style={styles.cardHead}>
-            <Text style={styles.assetId}>Cooler {rteCooler.id}</Text>
-            <Text style={styles.assetType}>Packaging Operations</Text>
-          </View>
-          <Text style={[styles.assetMeta, { color: rteCooler.cleanStatus ? '#66BB6A' : '#EF5350' }]}>
-            Clean: {rteCooler.cleanStatus ? 'Yes' : 'No'}
-          </Text>
-          <Text style={[styles.assetMeta, { color: rteCooler.qaPreOpStatus === 'Passed' ? '#66BB6A' : '#FFA726' }]}>
-            QA Pre-Op: {rteCooler.qaPreOpStatus}
-          </Text>
-          <Text style={[styles.assetMeta, { color: rteCooler.readyStatus ? '#66BB6A' : '#EF5350' }]}>
-            Ready: {rteCooler.readyStatus ? 'Yes' : 'No'}
-          </Text>
-          <Text style={styles.assetMeta}>Stored Batches: {waitingInRTE.length}</Text>
-          <View style={styles.storedList}>
-            {waitingInRTE.length === 0 ? <Text style={styles.assetMeta}>No batches waiting in cooler 67.</Text> : null}
-            {waitingInRTE.map((batch) => (
-              <Text key={batch.id} style={styles.assetMeta}>
-                {batch.id} | {batch.product} | ETA {batch.eta}
-              </Text>
-            ))}
-          </View>
-        </C3SCard>
-
-        <Text style={styles.sectionTitle}>Slicing Line</Text>
-        <View style={styles.cardGrid}>
-          {slicingLines.map((line) => (
-            <Pressable
-              key={line.id}
-              style={[styles.assetCard, slicingLines.length === 1 && styles.singleSlicingCard]}
-              onPress={() => setSelected({ kind: 'slicing', id: line.id })}>
-              <View style={styles.cardHead}>
-                <Text style={styles.assetId}>{line.id}</Text>
-                <Text style={styles.assetType}>Slicing Line</Text>
-              </View>
-              <Text style={[styles.assetMeta, { color: line.cleanStatus ? '#66BB6A' : '#EF5350' }]}>Clean: {line.cleanStatus ? 'Yes' : 'No'}</Text>
-              <Text style={[styles.assetMeta, { color: line.qaPreOpStatus === 'Passed' ? '#66BB6A' : '#FFA726' }]}>QA: {line.qaPreOpStatus}</Text>
-              <Text style={[styles.assetMeta, { color: line.ready ? '#66BB6A' : '#EF5350' }]}>Ready: {line.ready ? 'Yes' : 'No'}</Text>
-              <Text style={styles.assetMeta}>Assigned: {line.assignedBatchId ?? '--'}</Text>
-            </Pressable>
-          ))}
-        </View>
-
-        <Text style={styles.sectionTitle}>Packaging Lines</Text>
-        <View style={styles.cardGrid}>
-          {packagingLines.map((line) => (
-            <Pressable
-              key={line.id}
-              style={styles.assetCard}
-              onPress={() => setSelected({ kind: 'packaging', id: line.id })}>
-              <View style={styles.cardHead}>
-                <Text style={styles.assetId}>{line.id}</Text>
-                <Text style={styles.assetType}>
-                  {formatLineType(line.type)}
-                </Text>
-              </View>
-              <Text style={[styles.assetMeta, { color: line.cleanStatus ? '#66BB6A' : '#EF5350' }]}>Clean: {line.cleanStatus ? 'Yes' : 'No'}</Text>
-              <Text style={[styles.assetMeta, { color: line.qaPreOpStatus === 'Passed' ? '#66BB6A' : '#FFA726' }]}>QA: {line.qaPreOpStatus}</Text>
-              <Text style={[styles.assetMeta, { color: line.readyStatus ? '#66BB6A' : '#EF5350' }]}>Ready: {line.readyStatus ? 'Yes' : 'No'}</Text>
-              <Text style={styles.assetMeta}>Assigned: {line.assignedBatchId ?? '--'}</Text>
-            </Pressable>
-          ))}
-        </View>
-
-        <Text style={styles.sectionTitle}>Packaging Queue / Forecast</Text>
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow} style={styles.filterRowScroll}>
-          {filters.map((filter) => {
-            const active = filter.key === activeFilter;
+          <Text style={styles.sectionTitle}>Ready for Packaging</Text>
+          {readyForPackaging.length === 0 ? <Empty text="No products ready to package." /> : null}
+          {readyForPackaging.map((item) => {
+            const prep = item.prepQueueId ? prepById[item.prepQueueId] : null;
+            const chill = item.chillLogId ? chillById[item.chillLogId] : null;
+            const qa = item.qaCheckId ? qaChecks.find((q) => q.id === item.qaCheckId) : null;
             return (
-              <Pressable
-                key={filter.key}
-                style={[styles.filterChip, active && styles.filterChipActive]}
-                onPress={() => setActiveFilter(filter.key)}>
-                <Text style={[styles.filterChipText, active && styles.filterChipTextActive]}>{filter.label}</Text>
-              </Pressable>
+              <C3SCard key={item.id} borderColor="#2F6D8A">
+                <Text style={styles.itemTitle}>{item.productName || prep?.productNameSnapshot || '—'}</Text>
+                <Meta label="Product Code" value={prep?.productCodeSnapshot ?? prep?.productCode ?? '—'} />
+                <Meta label="Cases / Racks" value={`${prep?.cases ?? '—'} / ${item.racks ?? prep?.racks ?? '—'}`} />
+                <Meta label="Source QA Release Time" value={fmtTs(item.qaReviewedAt?.toMillis?.() || qa?.reviewedAt?.toMillis?.())} />
+                <Meta label="Source Chiller" value={chill?.chillerId ?? '—'} />
+                <Meta label="Expected Packaging ETA" value={prep?.packagingReadyETA ?? '—'} />
+                <Meta label="Current Department" value="Packaging Queue" />
+                <Meta label="Next Step" value="Start Packaging" />
+                <Meta label="From" value="QA" />
+                <Meta label="To" value="Packaging" />
+                <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onStartPackaging(item)}>
+                  <Text style={styles.primaryBtnText}>{workingId === item.id ? 'Starting...' : 'Start Packaging'}</Text>
+                </Pressable>
+              </C3SCard>
             );
           })}
-        </ScrollView>
 
-        <ScrollView contentContainerStyle={styles.queueList}>
-          {queue.length === 0 ? <Text style={styles.emptyText}>No batches in this Packaging Operations forecast window.</Text> : null}
-          {queue.map((batch) => {
-            const flow = getBatchFlowSnapshot(batch.id);
-            const hash = hashFromText(batch.id);
-            const expectedPackMinutes = batch.productProfile.averagePackagingMinutes;
-            const elapsedPackMinutes =
-              batch.packagingStatus === 'Running'
-                ? Math.max(10, Math.round(expectedPackMinutes * (0.7 + ((hash % 45) / 100))))
-                : batch.packagingStatus === 'Assigned'
-                  ? Math.max(8, Math.round(expectedPackMinutes * 0.35))
-                  : batch.packagingStatus === 'Completed'
-                    ? expectedPackMinutes
-                    : undefined;
-            const packNeedsAttention =
-              elapsedPackMinutes !== undefined && elapsedPackMinutes > expectedPackMinutes;
-            const packActionRequired =
-              elapsedPackMinutes !== undefined && elapsedPackMinutes > Math.round(expectedPackMinutes * 1.25);
-            const stageLabel =
-              batch.packagingStatus === 'Completed'
-                ? 'Packaging: Complete'
-                : batch.packagingStatus === 'Assigned' || batch.packagingStatus === 'Running'
-                  ? 'Packaging: On Line'
-                  : batch.stage === 'PACKAGING'
-                    ? 'Packaging: Ready for Line'
-                    : getStageDisplayLabel(batch.stage);
-            const locationLabel =
-              flow?.currentLocation ??
-              (batch.rteCoolerId
-                ? `RTE Cooler ${batch.rteCoolerId}`
-                : batch.packagingLineId
-                  ? `Packaging Line ${batch.packagingLineId}`
-                  : batch.slicingLineId
-                    ? `Slicing Line ${batch.slicingLineId}`
-                    : `RTE Cooler ${RTE_COOLER}`);
+          <Text style={styles.sectionTitle}>Packaging In Progress</Text>
+          {inProgress.length === 0 ? <Empty text="No product currently being packaged." /> : null}
+          {inProgress.map((item) => {
+            const startMs = item.packagingStartedAt?.toMillis?.();
+            const prep = item.prepQueueId ? prepById[item.prepQueueId] : null;
+            const expectedFinish = prep?.expectedPackMinutes && startMs
+              ? new Date(startMs + prep.expectedPackMinutes * 60000).toLocaleString()
+              : '—';
             return (
-            <C3SCard key={batch.id}>
-              <View style={styles.queueTopRow}>
-                <View>
-                  <Text style={styles.queueProduct}>{batch.product}</Text>
-                  <Text style={styles.queueId}>{batch.id}</Text>
+              <C3SCard key={item.id} borderColor="#FFA726">
+                <Text style={styles.itemTitle}>{item.productName || prep?.productNameSnapshot || '—'}</Text>
+                <Meta label="Start Time" value={fmtTs(startMs)} />
+                <Meta label="Elapsed Time" value={elapsedText(startMs)} />
+                <Meta label="Expected Finish" value={expectedFinish} />
+                <Meta label="Current Department" value="Packaging" />
+                <Meta label="Next Step" value="Mark Packaged or Place Hold" />
+                <Meta label="From" value="QA" />
+                <Meta label="To" value="Complete" />
+                <View style={styles.rowInput}>
+                  <TextInput style={styles.input} placeholder="Cases" placeholderTextColor="#6E7681" keyboardType="numeric" value={casesByLogId[item.id] ?? ''} onChangeText={(v) => setCasesByLogId((m) => ({ ...m, [item.id]: v }))} />
+                  <TextInput style={styles.input} placeholder="Units" placeholderTextColor="#6E7681" keyboardType="numeric" value={unitsByLogId[item.id] ?? ''} onChangeText={(v) => setUnitsByLogId((m) => ({ ...m, [item.id]: v }))} />
                 </View>
-                <View style={[styles.workflowBadge, { backgroundColor: workflowColors[getBatchWorkflowState(batch)] }]}>
-                  <Text style={styles.workflowBadgeText}>{getBatchWorkflowState(batch).toUpperCase()}</Text>
+                <TextInput style={styles.noteInput} placeholder="Packaging note" placeholderTextColor="#6E7681" value={noteByLogId[item.id] ?? ''} onChangeText={(v) => setNoteByLogId((m) => ({ ...m, [item.id]: v }))} />
+                <TextInput style={styles.noteInput} placeholder="Hold reason" placeholderTextColor="#6E7681" value={holdReasonByLogId[item.id] ?? ''} onChangeText={(v) => setHoldReasonByLogId((m) => ({ ...m, [item.id]: v }))} />
+                <View style={styles.actions}>
+                  <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onMarkPackaged(item)}><Text style={styles.primaryBtnText}>Mark Packaged</Text></Pressable>
+                  <Pressable style={styles.warnBtn} disabled={workingId === item.id} onPress={() => onPlaceHold(item)}><Text style={styles.warnBtnText}>Place Hold</Text></Pressable>
+                  <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onUpdateNote(item)}><Text style={styles.secondaryBtnText}>Add/Update Note</Text></Pressable>
                 </View>
-              </View>
-              <Text style={styles.queueMeta}>Stage: {stageLabel}</Text>
-              <Text style={styles.queueMeta}>Owner: {flow?.currentOwner ?? 'Packaging'}</Text>
-              <Text style={styles.queueMeta}>Location: {locationLabel}</Text>
-              <Text style={styles.queueMeta}>Waiting On: {flow?.waitingOn ?? getBatchHandoffLabel(batch)}</Text>
-              <Text style={styles.queueMeta}>Next Action: {flow?.nextValidAction ?? 'Monitor'}</Text>
-              <C3SBlockedChips reasons={getBatchBlockedReasons(batch)} />
-              <Text style={styles.queueForecast}>Forecast Ready: {batch.eta}</Text>
-              <Text style={styles.queueMeta}>
-                Estimated Pack: {expectedPackMinutes}m
-                {elapsedPackMinutes !== undefined ? ` | Elapsed: ${elapsedPackMinutes}m` : ''}
-              </Text>
-              {packActionRequired ? <Text style={styles.queueRiskUrgent}>Action Required: pack time exceeded</Text> : null}
-              {!packActionRequired && packNeedsAttention ? (
-                <Text style={styles.queueRiskWarning}>Needs Attention: pack time above expected</Text>
-              ) : null}
-              <Text style={styles.queueMeta}>
-                Racks {batch.rackCount} | Slicing: {batch.slicingStatus ?? '--'} | Packaging: {batch.packagingStatus ?? '--'}
-              </Text>
+              </C3SCard>
+            );
+          })}
+
+          <Text style={styles.sectionTitle}>Packaged</Text>
+          {packaged.length === 0 ? <Empty text="No completed packaging logs." /> : null}
+          {packaged.map((item) => (
+            <C3SCard key={item.id} borderColor="#66BB6A">
+              <Text style={styles.itemTitle}>{item.productName}</Text>
+              <Meta label="Completed Time" value={fmtTs(item.packagingCompletedAt?.toMillis?.())} />
+              <Meta label="Total Elapsed" value={elapsedText(item.packagingStartedAt?.toMillis?.(), item.packagingCompletedAt?.toMillis?.())} />
+              <Meta label="Notes" value={item.packagingNotes || '—'} />
             </C3SCard>
-            );
-          })}
+          ))}
+
+          <Text style={styles.sectionTitle}>Hold / Delay</Text>
+          {holdDelay.length === 0 ? <Empty text="No packaging hold/delay items." /> : null}
+          {holdDelay.map((item) => (
+            <C3SCard key={item.id} borderColor="#EF5350">
+              <Text style={styles.itemTitle}>{item.productName}</Text>
+              <Meta label="Reason" value={item.deviationNotes || '—'} />
+              <Meta label="Timestamp" value={fmtTs(item.deviationAt?.toMillis?.())} />
+              <Meta label="Source Product" value={item.productName || '—'} />
+              <TextInput style={styles.noteInput} placeholder="Update note" placeholderTextColor="#6E7681" value={noteByLogId[item.id] ?? ''} onChangeText={(v) => setNoteByLogId((m) => ({ ...m, [item.id]: v }))} />
+              <View style={styles.actions}>
+                <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onResume(item)}><Text style={styles.primaryBtnText}>Resume Packaging</Text></Pressable>
+                <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onUpdateNote(item)}><Text style={styles.secondaryBtnText}>Update Note</Text></Pressable>
+              </View>
+            </C3SCard>
+          ))}
         </ScrollView>
       </C3SPage>
-
-      <Modal visible={!!selected} transparent animationType="fade" onRequestClose={() => setSelected(null)}>
-        <View style={styles.modalOverlay}>
-          <Pressable style={StyleSheet.absoluteFill} onPress={() => setSelected(null)} />
-          {selected ? (
-            <View style={styles.modalCard}>
-              <View style={styles.modalHead}>
-                <Text style={styles.modalTitle}>
-                  {selected.kind === 'slicing' ? `Slicing ${selected.id}` : `Packaging ${selected.id}`}
-                </Text>
-                <Pressable style={styles.closeButton} onPress={() => setSelected(null)}>
-                  <Text style={styles.closeText}>Close</Text>
-                </Pressable>
-              </View>
-
-              {selected.kind === 'slicing' && selectedSlicing ? (
-                <>
-                  <Text style={styles.modalMeta}>Clean: {selectedSlicing.cleanStatus ? 'Yes' : 'No'}</Text>
-                  <Text style={styles.modalMeta}>QA Pre-Op: {selectedSlicing.qaPreOpStatus}</Text>
-                  <Text style={styles.modalMeta}>Ready: {selectedSlicing.ready ? 'Yes' : 'No'}</Text>
-                  <Text style={styles.modalMeta}>Assigned Batch: {selectedSlicing.assignedBatchId ?? '--'}</Text>
-                </>
-              ) : null}
-              {selected.kind === 'packaging' && selectedPackaging ? (
-                <>
-                  <Text style={styles.modalMeta}>Type: {selectedPackaging.type}</Text>
-                  <Text style={styles.modalMeta}>Clean: {selectedPackaging.cleanStatus ? 'Yes' : 'No'}</Text>
-                  <Text style={styles.modalMeta}>QA Pre-Op: {selectedPackaging.qaPreOpStatus}</Text>
-                  <Text style={styles.modalMeta}>Ready: {selectedPackaging.readyStatus ? 'Yes' : 'No'}</Text>
-                  <Text style={styles.modalMeta}>Assigned Batch: {selectedPackaging.assignedBatchId ?? '--'}</Text>
-                </>
-              ) : null}
-              {selectedBatch ? (
-                <Text style={styles.modalMeta}>
-                  Batch: {selectedBatch.id} | Slicing {selectedBatch.slicingStatus ?? '--'} | Packaging{' '}
-                  {selectedBatch.packagingStatus ?? '--'}
-                </Text>
-              ) : null}
-
-              <View style={styles.modalActions}>
-                <Text style={styles.nextActionLabel}>Next Action</Text>
-                {selectedPrimaryAction ? (
-                  <Pressable style={[styles.actionButton, styles.assignButton]} onPress={selectedPrimaryAction.onPress}>
-                    <Text style={styles.actionText}>{selectedPrimaryAction.label}</Text>
-                  </Pressable>
-                ) : (
-                  <Text style={styles.modalMeta}>No action available.</Text>
-                )}
-              </View>
-            </View>
-          ) : null}
-        </View>
-      </Modal>
     </C3SScreen>
   );
 }
 
+function Meta({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.metaRow}>
+      <Text style={styles.metaLabel}>{label}</Text>
+      <Text style={styles.metaValue}>{value || '—'}</Text>
+    </View>
+  );
+}
+
+function Empty({ text }: { text: string }) {
+  return (
+    <View style={styles.emptyCard}>
+      <Text style={styles.emptyText}>{text}</Text>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: '#0D1117' },
-  page: { flex: 1, backgroundColor: '#0D1117', paddingHorizontal: 20, paddingTop: 10 },
-  header: { marginBottom: 12 },
-  title: { color: '#E6EDF3', fontSize: 34, fontWeight: '800', letterSpacing: 0.2 },
-  subTitle: { color: '#8B949E', fontSize: 18, marginTop: 2, fontWeight: '600' },
-  kpiRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
-  kpiCard: {
+  content: { gap: 8, paddingBottom: 24 },
+  refreshBtn: {
+    borderWidth: 1,
+    borderColor: '#30363D',
+    backgroundColor: '#151A21',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  refreshText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
+  sectionTitle: { color: '#8AB4F8', fontSize: 13, fontWeight: '800', marginTop: 4 },
+  itemTitle: { color: '#E6EDF3', fontSize: 13, fontWeight: '800', marginBottom: 4 },
+  metaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8, marginBottom: 2 },
+  metaLabel: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
+  metaValue: { color: '#C9D1D9', fontSize: 11, fontWeight: '600' },
+  rowInput: { flexDirection: 'row', gap: 8, marginTop: 6 },
+  input: {
     flex: 1,
-    borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    borderRadius: 12,
-    paddingVertical: 10,
-    minHeight: 76,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  kpiValue: { color: '#F0F6FC', fontSize: 24, fontWeight: '800' },
-  kpiLabel: { color: '#9DA7B1', fontSize: 12, fontWeight: '700' },
-  sectionTitle: { color: '#E6EDF3', fontSize: 22, fontWeight: '800', marginTop: 4, marginBottom: 8 },
-  coolerCard: {
-    borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    borderRadius: 12,
-    padding: 10,
-    marginBottom: 10,
-  },
-  storedList: { marginTop: 6, gap: 2 },
-  cardGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 10 },
-  assetCard: {
-    width: 220,
-    borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    borderRadius: 12,
-    padding: 10,
-    minHeight: 126,
-  },
-  singleSlicingCard: {
-    width: 320,
-  },
-  cardHead: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
-  assetId: { color: '#F0F6FC', fontSize: 18, fontWeight: '800' },
-  assetType: { color: '#9DA7B1', fontSize: 12, fontWeight: '700' },
-  assetMeta: { color: '#C9D1D9', fontSize: 12, fontWeight: '700', marginTop: 2 },
-  filterRowScroll: { marginBottom: 10, maxHeight: 56 },
-  filterRow: { gap: 8, paddingRight: 8 },
-  filterChip: {
-    minHeight: 42,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    paddingHorizontal: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  filterChipActive: {
-    borderColor: '#4FC3F7',
-    backgroundColor: '#13314A',
-  },
-  filterChipText: {
-    color: '#AAB4BE',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  filterChipTextActive: {
-    color: '#E6EDF3',
-  },
-  queueList: { gap: 8, paddingBottom: 16 },
-  queueCard: {
-    borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    borderRadius: 10,
-    padding: 10,
-  },
-  queueTopRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  workflowBadge: {
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    minHeight: 24,
-    paddingVertical: 3,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  workflowBadgeText: {
-    color: '#0D1117',
-    fontSize: 11,
-    fontWeight: '800',
-  },
-  queueId: { color: '#F0F6FC', fontSize: 16, fontWeight: '800' },
-  queueProduct: { color: '#E6EDF3', fontSize: 15, fontWeight: '700', marginTop: 3 },
-  queueMeta: { color: '#9DA7B1', fontSize: 13, fontWeight: '700', marginTop: 2 },
-  queueForecast: { color: '#A5D6A7', fontSize: 14, fontWeight: '800', marginTop: 3 },
-  queueRiskWarning: { color: '#FFE082', fontSize: 12, fontWeight: '800', marginTop: 2 },
-  queueRiskUrgent: { color: '#FFCDD2', fontSize: 12, fontWeight: '800', marginTop: 2 },
-  emptyText: { color: '#9DA7B1', fontSize: 14, fontWeight: '700' },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.55)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-  },
-  modalCard: {
-    width: '100%',
-    maxWidth: 780,
-    borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    borderRadius: 14,
-    padding: 14,
-    gap: 8,
-  },
-  modalHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  modalTitle: { color: '#E6EDF3', fontSize: 24, fontWeight: '800' },
-  closeButton: {
     borderWidth: 1,
     borderColor: '#30363D',
     backgroundColor: '#0D1117',
     borderRadius: 8,
-    paddingHorizontal: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+    color: '#E6EDF3',
+    fontSize: 12,
+  },
+  noteInput: {
+    borderWidth: 1,
+    borderColor: '#30363D',
+    backgroundColor: '#0D1117',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 7,
+    color: '#E6EDF3',
+    fontSize: 12,
+    marginTop: 6,
+  },
+  actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 6 },
+  primaryBtn: {
+    borderWidth: 1,
+    borderColor: '#2F6D8A',
+    backgroundColor: '#13314A',
+    borderRadius: 8,
+    paddingHorizontal: 10,
     paddingVertical: 7,
   },
-  closeText: { color: '#E6EDF3', fontSize: 13, fontWeight: '700' },
-  modalMeta: { color: '#C9D1D9', fontSize: 14, fontWeight: '700' },
-  modalActions: { gap: 8, marginTop: 4 },
-  nextActionLabel: { color: '#9DA7B1', fontSize: 12, fontWeight: '700' },
-  actionButton: {
-    width: '100%',
-    minHeight: 44,
-    borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 12,
+  primaryBtnText: { color: '#E6EDF3', fontSize: 11, fontWeight: '700' },
+  warnBtn: {
+    borderWidth: 1,
+    borderColor: '#C62828',
+    backgroundColor: '#2A1414',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
   },
-  assignButton: { backgroundColor: '#4E342E' },
-  actionText: { color: '#F0F6FC', fontSize: 13, fontWeight: '800' },
+  warnBtnText: { color: '#FFB4B4', fontSize: 11, fontWeight: '700' },
+  secondaryBtn: {
+    borderWidth: 1,
+    borderColor: '#455A64',
+    backgroundColor: '#1A2430',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  secondaryBtnText: { color: '#CFD8DC', fontSize: 11, fontWeight: '700' },
+  emptyCard: {
+    borderWidth: 1,
+    borderColor: '#30363D',
+    borderRadius: 8,
+    backgroundColor: '#11161D',
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+  },
+  emptyText: { color: '#8B949E', fontSize: 12 },
+  info: { color: '#81D4FA', fontSize: 12, fontWeight: '700' },
+  error: { color: '#FF8A80', fontSize: 12, fontWeight: '700' },
 });

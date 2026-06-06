@@ -1,339 +1,399 @@
-import { useMemo } from 'react';
-import { useLocalSearchParams, useRouter } from 'expo-router';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useCallback, useMemo, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 
-import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader, C3SSectionTitle } from '@/components/c3s-ui';
+import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
 import {
-  BATCH_STATUS_COLORS,
-  QA_STATUSES,
-  STAGE_COLORS,
-  getStageDisplayLabel,
-  type QAStatus,
-} from '@/constants/c3s';
-import { useC3S } from '@/store/c3s-store';
+  getChillLogs,
+  getPrepQueueItems,
+  getQAChecks,
+  type ChillLogItem,
+  type PrepQueueItem,
+  type QACheckItem,
+} from '@/lib/firebase/repository';
+import { logFirebaseError, toOperatorMessage } from '@/lib/auth/diagnostics';
+import {
+  getOperationalItems,
+  oItemAppendQANote,
+  oItemQAResubmit,
+  oItemQAReview,
+  type OItemItem,
+} from '@/lib/operational-items';
 
-type QADecision =
-  | (typeof QA_STATUSES.PASS)
-  | (typeof QA_STATUSES.CONDITIONAL_PASS)
-  | (typeof QA_STATUSES.HOLD)
-  | (typeof QA_STATUSES.FAIL);
+let _sessionReviewer = '';
 
-function getParamString(value: string | string[] | undefined, fallback: string): string {
-  if (Array.isArray(value)) {
-    return value[0] ?? fallback;
-  }
-  return value ?? fallback;
-}
-
-function normalizeQADecision(status: QAStatus): QADecision | 'Not set' {
-  if (
-    status === QA_STATUSES.PASS ||
-    status === QA_STATUSES.CONDITIONAL_PASS ||
-    status === QA_STATUSES.HOLD ||
-    status === QA_STATUSES.FAIL
-  ) {
-    return status;
-  }
-  return 'Not set';
+function fmtTs(ms?: number) {
+  if (!ms || !Number.isFinite(ms)) return '—';
+  return new Date(ms).toLocaleString();
 }
 
 export default function QAReviewScreen() {
-  const router = useRouter();
-  const params = useLocalSearchParams();
-  const { getBatch, submitQADecision, releaseToPackaging, getBatchFlowSnapshot, canViewBatchInArea } = useC3S();
+  const [oItems, setOItems] = useState<OItemItem[]>([]);
+  const [qaChecks, setQaChecks] = useState<QACheckItem[]>([]);
+  const [preps, setPreps] = useState<PrepQueueItem[]>([]);
+  const [chillLogs, setChillLogs] = useState<ChillLogItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [reviewer, setReviewer] = useState(_sessionReviewer);
+  const [noteById, setNoteById] = useState<Record<string, string>>({});
+  const [workingId, setWorkingId] = useState<string | null>(null);
 
-  const batchId = getParamString(params.batchId, '');
-  const batch = batchId ? getBatch(batchId) : undefined;
-  const flow = batch ? getBatchFlowSnapshot(batch.id) : undefined;
-  const visibleToQA = batch ? canViewBatchInArea('qa', batch.id) : false;
+  const load = useCallback(async () => {
+    setIsLoading(true);
+    setLoadError(null);
+    const results = await Promise.allSettled([
+      getOperationalItems(),
+      getQAChecks(),
+      getPrepQueueItems(),
+      getChillLogs(),
+    ]);
+    const [oR, qR, pR, cR] = results;
+    if (oR.status === 'fulfilled') setOItems(oR.value);
+    if (qR.status === 'fulfilled') setQaChecks(qR.value);
+    if (pR.status === 'fulfilled') setPreps(pR.value);
+    if (cR.status === 'fulfilled') setChillLogs(cR.value);
+    const firstFail = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+    if (firstFail) {
+      logFirebaseError('QAReview', 'operational_items/qa_checks/prep_queue/chill_logs', firstFail.reason);
+      setLoadError(toOperatorMessage(firstFail.reason, 'Failed to load QA data.'));
+    }
+    setIsLoading(false);
+  }, []);
 
-  const currentDecision = useMemo(() => (batch ? normalizeQADecision(batch.qaStatus) : 'Not set'), [batch]);
-  const canSubmitDecision = batch?.stage === 'QA' && visibleToQA;
-  const canRelease = batch?.qaStatus === QA_STATUSES.PASS && batch?.stage === 'QA' && visibleToQA;
+  useFocusEffect(useCallback(() => { load(); }, [load]));
 
-  if (!batch || !visibleToQA) {
-    return (
-      <C3SScreen>
-        <C3SPage>
-          <C3SScreenHeader title="QA Review" />
-          <Text style={styles.metaLabel}>No batch currently owned by QA for review.</Text>
-        </C3SPage>
-      </C3SScreen>
-    );
+  const prepById = useMemo(
+    () => preps.reduce<Record<string, PrepQueueItem>>((map, p) => { map[p.id] = p; return map; }, {}),
+    [preps],
+  );
+
+  const chillById = useMemo(
+    () => chillLogs.reduce<Record<string, ChillLogItem>>((map, c) => { map[c.id] = c; return map; }, {}),
+    [chillLogs],
+  );
+
+  const qaStageItems = useMemo(
+    () => oItems.filter((item) => item.stage === 'qa' || item.status === 'ready_for_packaging'),
+    [oItems],
+  );
+
+  const readyForQa = useMemo(
+    () => qaStageItems.filter((item) => item.status === 'ready_for_qa'),
+    [qaStageItems],
+  );
+
+  const qaHold = useMemo(
+    () => qaStageItems.filter((item) => item.status === 'qa_hold' || item.status === 'qa_review_required' || item.status === 'hold'),
+    [qaStageItems],
+  );
+
+  const released = useMemo(
+    () => qaStageItems.filter((item) => item.status === 'ready_for_packaging'),
+    [qaStageItems],
+  );
+
+  const deviationNotes = useMemo(
+    () => qaStageItems.filter((item) => item.hasDeviation || (item.qaNotes ?? '').toLowerCase().includes('deviation')).slice(0, 10),
+    [qaStageItems],
+  );
+
+  async function onApprove(item: OItemItem) {
+    const note = (noteById[item.id] ?? '').trim();
+    if (!item.qaCheckId) { setActionMsg('Missing QA check linkage.'); return; }
+    if (!reviewer.trim()) { setActionMsg('Reviewer is required.'); return; }
+    if (note.length < 10) { setActionMsg('QA note must be at least 10 characters.'); return; }
+    try {
+      setWorkingId(item.id);
+      await oItemQAReview(item.id, item.stage, item.status, item.qaCheckId, {
+        decision: 'approve_for_packaging',
+        reviewedBy: reviewer.trim(),
+        notes: note,
+      });
+      setActionMsg(`Released to Packaging: ${item.productName || item.id}`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to release to packaging.'));
+    } finally {
+      setWorkingId(null);
+    }
   }
 
-  const confirmDecision = (nextDecision: QADecision) => {
-    if (!canSubmitDecision) return;
-
-    Alert.alert('Confirm QA Decision', `Apply ${nextDecision} to ${batch.id}?`, [
-      { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Confirm',
-        style: 'default',
-        onPress: () => {
-          submitQADecision(batch.id, nextDecision);
-          Alert.alert('QA Action Saved', `${nextDecision} recorded for ${batch.id}`);
-        },
-      },
-    ]);
-  };
-
-  const release = () => {
-    if (!canRelease) {
-      Alert.alert('Validation', 'Release is only allowed after QA Pass on a QA-stage batch.');
-      return;
+  async function onHold(item: OItemItem) {
+    const note = (noteById[item.id] ?? '').trim();
+    if (!item.qaCheckId) { setActionMsg('Missing QA check linkage.'); return; }
+    if (!reviewer.trim()) { setActionMsg('Reviewer is required.'); return; }
+    if (note.length < 10) { setActionMsg('QA hold note must be at least 10 characters.'); return; }
+    try {
+      setWorkingId(item.id);
+      await oItemQAReview(item.id, item.stage, item.status, item.qaCheckId, {
+        decision: 'qa_hold',
+        reviewedBy: reviewer.trim(),
+        notes: note,
+      });
+      setActionMsg(`Placed on QA Hold: ${item.productName || item.id}`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to place QA hold.'));
+    } finally {
+      setWorkingId(null);
     }
+  }
 
-    const released = releaseToPackaging(batch.id);
-    if (released) {
-      Alert.alert('Released', `${batch.id} released to packaging.`);
-      return;
+  async function onReleaseHold(item: OItemItem) {
+    const note = (noteById[item.id] ?? '').trim();
+    if (!item.qaCheckId) { setActionMsg('Missing QA check linkage.'); return; }
+    if (!note) { setActionMsg('Release hold note is required.'); return; }
+    try {
+      setWorkingId(item.id);
+      await oItemQAResubmit(item.id, item.stage, item.status, item.qaCheckId, note);
+      setActionMsg(`Released hold and re-submitted: ${item.productName || item.id}`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to release hold.'));
+    } finally {
+      setWorkingId(null);
     }
+  }
 
-    Alert.alert('Validation', 'Release could not be completed. Verify RTE cooler readiness.');
-  };
+  async function onAddNote(item: OItemItem) {
+    const note = (noteById[item.id] ?? '').trim();
+    if (!item.qaCheckId) { setActionMsg('Missing QA check linkage.'); return; }
+    if (!note) { setActionMsg('QA note is required.'); return; }
+    try {
+      setWorkingId(item.id);
+      await oItemAppendQANote(item.id, item.qaCheckId, note);
+      setActionMsg(`QA note added: ${item.productName || item.id}`);
+      await load();
+    } catch (e) {
+      setActionMsg(toOperatorMessage(e, 'Failed to add QA note.'));
+    } finally {
+      setWorkingId(null);
+    }
+  }
 
   return (
     <C3SScreen>
       <C3SPage>
-        <View style={styles.headerRow}>
-          <Pressable style={styles.backButton} onPress={() => router.back()}>
-            <Text style={styles.backButtonText}>Back</Text>
-          </Pressable>
-          <Text style={styles.screenTitle}>QA Review</Text>
+        <C3SScreenHeader
+          title="QA Review"
+          subtitle={`Ready for QA: ${readyForQa.length}`}
+          right={<Pressable style={styles.refreshBtn} onPress={load}><Text style={styles.refreshText}>Refresh</Text></Pressable>}
+        />
+
+        <View style={styles.reviewerRow}>
+          <Text style={styles.reviewerLabel}>Reviewer</Text>
+          <TextInput
+            style={styles.reviewerInput}
+            value={reviewer}
+            onChangeText={(v) => { setReviewer(v); _sessionReviewer = v; }}
+            placeholder="Reviewer name"
+            placeholderTextColor="#6E7681"
+            autoCorrect={false}
+            autoCapitalize="words"
+          />
         </View>
 
-        <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-          <C3SCard>
-            <View style={styles.headerTopRow}>
-              <Text style={styles.batchId}>{batch.id}</Text>
-              <View style={[styles.statusPill, { backgroundColor: BATCH_STATUS_COLORS[batch.status] }]}>
-                <Text style={styles.statusPillText}>{batch.status}</Text>
+        <ScrollView contentContainerStyle={styles.content}>
+          {isLoading ? <Text style={styles.info}>Loading QA gate data...</Text> : null}
+          {loadError ? <Text style={styles.error}>{loadError}</Text> : null}
+          {actionMsg ? <Text style={styles.info}>{actionMsg}</Text> : null}
+
+          <Text style={styles.sectionTitle}>Ready for QA</Text>
+          {readyForQa.length === 0 ? <Empty text="No products ready for QA." /> : null}
+          {readyForQa.map((item) => {
+            const prep = item.prepQueueId ? prepById[item.prepQueueId] : null;
+            const chill = item.chillLogId ? chillById[item.chillLogId] : null;
+            return (
+              <C3SCard key={item.id} borderColor="#2F6D8A">
+                <Text style={styles.itemTitle}>{item.productName || prep?.productNameSnapshot || '—'}</Text>
+                <Meta label="Product Code" value={prep?.productCodeSnapshot ?? prep?.productCode ?? '—'} />
+                <Meta label="Cases / Racks" value={`${prep?.cases ?? '—'} / ${item.racks ?? prep?.racks ?? '—'}`} />
+                <Meta label="Source Chiller" value={chill?.chillerId ?? '—'} />
+                <Meta label="Chill Complete Time" value={fmtTs(item.qaTimestamp?.toMillis?.())} />
+                <Meta label="Expected Packaging ETA" value={prep?.packagingReadyETA ?? '—'} />
+                <Meta label="Deviation" value={item.hasDeviation ? 'Yes' : 'No'} />
+                <Meta label="Current Department" value="QA" />
+                <Meta label="Next Step" value="Approve to Packaging or Hold" />
+                <Meta label="From" value="Chill" />
+                <Meta label="To" value="Packaging" />
+                <TextInput
+                  style={styles.noteInput}
+                  value={noteById[item.id] ?? ''}
+                  onChangeText={(v) => setNoteById((m) => ({ ...m, [item.id]: v }))}
+                  placeholder="QA note"
+                  placeholderTextColor="#6E7681"
+                />
+                <View style={styles.actions}>
+                  <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onApprove(item)}>
+                    <Text style={styles.primaryBtnText}>{workingId === item.id ? 'Saving...' : 'Approve / Release to Packaging'}</Text>
+                  </Pressable>
+                  <Pressable style={styles.warnBtn} disabled={workingId === item.id} onPress={() => onHold(item)}>
+                    <Text style={styles.warnBtnText}>Place QA Hold</Text>
+                  </Pressable>
+                  <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onAddNote(item)}>
+                    <Text style={styles.secondaryBtnText}>Add QA Note</Text>
+                  </Pressable>
+                </View>
+              </C3SCard>
+            );
+          })}
+
+          <Text style={styles.sectionTitle}>QA Hold</Text>
+          {qaHold.length === 0 ? <Empty text="No items on QA hold." /> : null}
+          {qaHold.map((item) => (
+            <C3SCard key={item.id} borderColor="#C62828">
+              <Text style={styles.itemTitle}>{item.productName || item.prepQueueId || '—'}</Text>
+              <Meta label="Hold Reason" value={item.qaNotes || item.deviationNotes || '—'} />
+              <Meta label="Timestamp" value={fmtTs(item.qaReviewedAt?.toMillis?.() || item.qaTimestamp?.toMillis?.())} />
+              <Meta label="Reviewer" value={item.qaReviewedBy || '—'} />
+              <Meta label="Current Department" value="QA Hold" />
+              <Meta label="Next Step" value="Release Hold or Update Note" />
+              <Meta label="From" value="QA" />
+              <Meta label="To" value="QA Review" />
+              <TextInput
+                style={styles.noteInput}
+                value={noteById[item.id] ?? ''}
+                onChangeText={(v) => setNoteById((m) => ({ ...m, [item.id]: v }))}
+                placeholder="Hold update note"
+                placeholderTextColor="#6E7681"
+              />
+              <View style={styles.actions}>
+                <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onReleaseHold(item)}>
+                  <Text style={styles.primaryBtnText}>Release Hold</Text>
+                </Pressable>
+                <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onAddNote(item)}>
+                  <Text style={styles.secondaryBtnText}>Update Note</Text>
+                </Pressable>
               </View>
-            </View>
+            </C3SCard>
+          ))}
 
-            <View style={styles.metaRow}>
-              <Text style={styles.metaLabel}>Product</Text>
-              <Text style={styles.metaValue}>{batch.product}</Text>
-            </View>
-            <View style={styles.metaRow}>
-              <Text style={styles.metaLabel}>Smokehouse</Text>
-              <Text style={styles.metaValue}>{batch.smokehouse}</Text>
-            </View>
-            <View style={styles.metaRow}>
-              <Text style={styles.metaLabel}>Rack Count</Text>
-              <Text style={styles.metaValue}>{batch.rackCount}</Text>
-            </View>
-            <View style={styles.metaRow}>
-              <Text style={styles.metaLabel}>Stage</Text>
-              <Text style={[styles.metaValue, { color: STAGE_COLORS[batch.stage] }]}>{getStageDisplayLabel(batch.stage)}</Text>
-            </View>
-            {flow ? (
-              <>
-                <View style={styles.metaRow}>
-                  <Text style={styles.metaLabel}>Owner</Text>
-                  <Text style={styles.metaValue}>{flow.currentOwner}</Text>
-                </View>
-                <View style={styles.metaRow}>
-                  <Text style={styles.metaLabel}>Location</Text>
-                  <Text style={styles.metaValue}>{flow.currentLocation}</Text>
-                </View>
-                <View style={styles.metaRow}>
-                  <Text style={styles.metaLabel}>Waiting On</Text>
-                  <Text style={styles.metaValue}>{flow.waitingOn}</Text>
-                </View>
-                <View style={styles.metaRow}>
-                  <Text style={styles.metaLabel}>Next Action</Text>
-                  <Text style={styles.metaValue}>{flow.nextValidAction}</Text>
-                </View>
-              </>
-            ) : null}
-            <View style={styles.metaRow}>
-              <Text style={styles.metaLabel}>Current Status</Text>
-              <Text style={styles.metaValue}>{batch.status}</Text>
-            </View>
-            <View style={styles.metaRow}>
-              <Text style={styles.metaLabel}>ETA</Text>
-              <Text style={styles.etaValue}>{batch.eta}</Text>
-            </View>
-          </C3SCard>
+          <Text style={styles.sectionTitle}>Released to Packaging</Text>
+          {released.length === 0 ? <Empty text="No items released to packaging yet." /> : null}
+          {released.map((item) => (
+            <C3SCard key={item.id} borderColor="#66BB6A">
+              <Text style={styles.itemTitle}>{item.productName || item.prepQueueId || '—'}</Text>
+              <Meta label="Released Time" value={fmtTs(item.qaReviewedAt?.toMillis?.() || item.qaTimestamp?.toMillis?.())} />
+              <Meta label="Reviewer" value={item.qaReviewedBy || '—'} />
+              <Meta label="Destination" value="Packaging" />
+              <Meta label="Release Notes" value={item.qaNotes || '—'} />
+              <Meta label="Current Department" value="Packaging Queue" />
+              <Meta label="Next Step" value="Start Packaging" />
+              <Meta label="From" value="QA" />
+              <Meta label="To" value="Packaging" />
+            </C3SCard>
+          ))}
 
-          <C3SCard>
-            <C3SSectionTitle title="Operator Actions" />
-            <Text style={styles.helperText}>Quick-action mode: select one QA decision and confirm.</Text>
-            <Text style={styles.currentDecision}>Current Decision: {currentDecision}</Text>
-            {!canSubmitDecision ? (
-              <Text style={styles.blockedText}>QA decisions are only available when batch stage is QA.</Text>
-            ) : null}
-
-            <View style={styles.actionsGrid}>
-              <Pressable
-                style={[styles.actionButton, styles.passButton, !canSubmitDecision && styles.disabledButton]}
-                disabled={!canSubmitDecision}
-                onPress={() => confirmDecision(QA_STATUSES.PASS)}>
-                <Text style={styles.actionText}>Pass</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionButton, styles.conditionalButton, !canSubmitDecision && styles.disabledButton]}
-                disabled={!canSubmitDecision}
-                onPress={() => confirmDecision(QA_STATUSES.CONDITIONAL_PASS)}>
-                <Text style={styles.actionText}>Conditional Pass</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionButton, styles.holdButton, !canSubmitDecision && styles.disabledButton]}
-                disabled={!canSubmitDecision}
-                onPress={() => confirmDecision(QA_STATUSES.HOLD)}>
-                <Text style={styles.actionText}>Hold</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionButton, styles.failButton, !canSubmitDecision && styles.disabledButton]}
-                disabled={!canSubmitDecision}
-                onPress={() => confirmDecision(QA_STATUSES.FAIL)}>
-                <Text style={styles.actionText}>Fail</Text>
-              </Pressable>
-              <Pressable
-                style={[styles.actionButton, styles.releaseButton, !canRelease && styles.releaseButtonDisabled, styles.fullWidth]}
-                onPress={release}>
-                <Text style={styles.actionText}>Release to Packaging</Text>
-              </Pressable>
-            </View>
-          </C3SCard>
+          <Text style={styles.sectionTitle}>Deviation Notes</Text>
+          {deviationNotes.length === 0 ? <Empty text="No QA deviation notes currently." /> : null}
+          {deviationNotes.map((item) => (
+            <C3SCard key={`dev-${item.id}`} borderColor="#EF5350">
+              <Text style={styles.itemTitle}>{item.productName || item.prepQueueId || '—'}</Text>
+              <Meta label="Timestamp" value={fmtTs(item.qaReviewedAt?.toMillis?.() || item.qaTimestamp?.toMillis?.())} />
+              <Meta label="Reviewer" value={item.qaReviewedBy || '—'} />
+              <Meta label="Note" value={item.qaNotes || item.deviationNotes || '—'} />
+            </C3SCard>
+          ))}
         </ScrollView>
       </C3SPage>
     </C3SScreen>
   );
 }
 
+function Meta({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.metaRow}>
+      <Text style={styles.metaLabel}>{label}</Text>
+      <Text style={styles.metaValue}>{value || '—'}</Text>
+    </View>
+  );
+}
+
+function Empty({ text }: { text: string }) {
+  return (
+    <View style={styles.emptyCard}>
+      <Text style={styles.emptyText}>{text}</Text>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
-  headerRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    marginBottom: 12,
+  content: { gap: 8, paddingBottom: 24 },
+  refreshBtn: {
+    borderWidth: 1,
+    borderColor: '#30363D',
+    backgroundColor: '#151A21',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
   },
-  backButton: {
-    backgroundColor: '#30363D',
-    borderRadius: 10,
-    minHeight: 46,
-    paddingHorizontal: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  backButtonText: {
-    color: '#F0F6FC',
-    fontSize: 15,
-    fontWeight: '800',
-  },
-  screenTitle: {
+  refreshText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
+  reviewerRow: { marginBottom: 8, gap: 4 },
+  reviewerLabel: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
+  reviewerInput: {
+    borderWidth: 1,
+    borderColor: '#30363D',
+    backgroundColor: '#0D1117',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     color: '#E6EDF3',
-    fontSize: 32,
-    fontWeight: '800',
-  },
-  content: {
-    paddingBottom: 20,
-    gap: 12,
-  },
-  headerTopRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 10,
-  },
-  batchId: {
-    color: '#F0F6FC',
-    fontSize: 22,
-    fontWeight: '800',
-  },
-  statusPill: {
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-  },
-  statusPillText: {
-    color: '#0D1117',
     fontSize: 13,
-    fontWeight: '800',
   },
-  metaRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: 3,
-  },
-  metaLabel: {
-    color: '#9DA7B1',
-    fontSize: 16,
-    fontWeight: '600',
-  },
-  metaValue: {
+  sectionTitle: { color: '#8AB4F8', fontSize: 13, fontWeight: '800', marginTop: 4 },
+  itemTitle: { color: '#E6EDF3', fontSize: 13, fontWeight: '800', marginBottom: 4 },
+  metaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8, marginBottom: 2 },
+  metaLabel: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
+  metaValue: { color: '#C9D1D9', fontSize: 11, fontWeight: '600' },
+  noteInput: {
+    borderWidth: 1,
+    borderColor: '#30363D',
+    backgroundColor: '#0D1117',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 7,
     color: '#E6EDF3',
-    fontSize: 17,
-    fontWeight: '700',
-  },
-  etaValue: {
-    color: '#A5D6A7',
-    fontSize: 20,
-    fontWeight: '800',
-  },
-  helperText: {
-    color: '#9DA7B1',
     fontSize: 12,
-    fontWeight: '700',
-    marginBottom: 2,
+    marginTop: 6,
   },
-  currentDecision: {
-    color: '#E6EDF3',
-    fontSize: 16,
-    fontWeight: '700',
-    marginTop: 8,
-    marginBottom: 8,
+  actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 6 },
+  primaryBtn: {
+    borderWidth: 1,
+    borderColor: '#2F6D8A',
+    backgroundColor: '#13314A',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
   },
-  blockedText: {
-    color: '#EF9A9A',
-    fontSize: 13,
-    fontWeight: '700',
-    marginBottom: 8,
+  primaryBtnText: { color: '#E6EDF3', fontSize: 11, fontWeight: '700' },
+  warnBtn: {
+    borderWidth: 1,
+    borderColor: '#C62828',
+    backgroundColor: '#2A1414',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
   },
-  actionsGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
+  warnBtnText: { color: '#FFB4B4', fontSize: 11, fontWeight: '700' },
+  secondaryBtn: {
+    borderWidth: 1,
+    borderColor: '#455A64',
+    backgroundColor: '#1A2430',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
   },
-  actionButton: {
-    minHeight: 50,
-    borderRadius: 12,
-    flexBasis: '49%',
-    alignItems: 'center',
-    justifyContent: 'center',
+  secondaryBtnText: { color: '#CFD8DC', fontSize: 11, fontWeight: '700' },
+  emptyCard: {
+    borderWidth: 1,
+    borderColor: '#30363D',
+    borderRadius: 8,
+    backgroundColor: '#11161D',
+    paddingVertical: 10,
     paddingHorizontal: 10,
   },
-  actionText: {
-    color: '#F0F6FC',
-    fontSize: 16,
-    fontWeight: '800',
-    textAlign: 'center',
-  },
-  passButton: {
-    backgroundColor: '#2E7D32',
-  },
-  conditionalButton: {
-    backgroundColor: '#1976D2',
-  },
-  holdButton: {
-    backgroundColor: '#EF6C00',
-  },
-  failButton: {
-    backgroundColor: '#C62828',
-  },
-  releaseButton: {
-    backgroundColor: '#00897B',
-  },
-  releaseButtonDisabled: {
-    backgroundColor: '#455A64',
-  },
-  disabledButton: {
-    opacity: 0.45,
-  },
-  fullWidth: {
-    flexBasis: '100%',
-  },
+  emptyText: { color: '#8B949E', fontSize: 12 },
+  info: { color: '#81D4FA', fontSize: 12, fontWeight: '700' },
+  error: { color: '#FF8A80', fontSize: 12, fontWeight: '700' },
 });
