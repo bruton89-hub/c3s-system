@@ -130,7 +130,7 @@ if (firebaseReady) {
     authInstance = getAuth(firebaseApp);
     _firebaseInitialized = true;
     // eslint-disable-next-line no-console
-    console.log('[BOOT_4] Firebase initialized OK', { projectId: config.projectId });
+    console.log('[BOOT_4] Firebase initialized OK', { projectId: config.projectId ? '(set)' : '(empty)' });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     _firebaseInitError = `C3S startup error: Firebase initialization failed. ${msg}`;

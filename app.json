@@ -53,11 +53,7 @@
       "reactCompiler": true
     },
     "extra": {
-      "router": {},
-      "eas": {
-        "projectId": "7724c5f5-1a70-4af6-9120-4397c339b6cb"
-      }
-    },
-    "owner": "momentum_app"
+      "router": {}
+    }
   }
 }
