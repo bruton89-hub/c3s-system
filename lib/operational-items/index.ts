@@ -27,9 +27,12 @@ export {
 export {
   getOperationalItems,
   getOperationalItem,
+  getHoldEvents,
+  placeOperationalItemOnHold,
+  resolveOperationalItemHold,
   createOperationalItem,
   oItemSendPlanToRTC,
-  oItemCreateManual,
+  oItemCreateManualFromInput,
   oItemAdvanceRTCStatus,
   oItemAssignSmokehouse,
   oItemAssignSmokehouseOnly,

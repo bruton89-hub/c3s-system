@@ -76,6 +76,21 @@ export function toOperatorMessage(err: unknown, fallback: string): string {
   if (msg.includes('network') || msg.includes('unavailable') || msg.includes('offline')) {
     return 'Unable to reach the server. Check network and try again.';
   }
+  if (msg.includes('aborted') || msg.includes('production state changed') || msg.includes('stale')) {
+    return 'Production state changed. Refresh and try again.';
+  }
+  if (msg.includes('failed-precondition') || msg.includes('invalid transition')) {
+    return 'Action rejected because the batch is no longer in the required state.';
+  }
+  if (msg.includes('already-exists') || msg.includes('equipment') && msg.includes('conflict')) {
+    return 'Equipment assignment changed or is no longer available. Refresh and choose again.';
+  }
+  if (msg.includes('invalid-argument') || msg.includes('validation')) {
+    return 'Action rejected because required information is missing or invalid.';
+  }
+  if (msg.includes('internal') || msg.includes('server')) {
+    return 'Secure production service is unavailable. Nothing was changed; try again.';
+  }
   if (msg.includes('not-found')) {
     return 'Data not found. The record may have been deleted.';
   }

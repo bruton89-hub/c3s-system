@@ -10,6 +10,17 @@
     },
     "production": {
       "environment": "production",
+      "env": {
+        "EXPO_PUBLIC_APP_ENV": "production",
+        "EXPO_PUBLIC_PRODUCTION_FIREBASE_PROJECT_ID": "c3s-system",
+        "EXPO_PUBLIC_USE_FIREBASE_EMULATORS": "false",
+        "EXPO_PUBLIC_ENABLE_ALERT_PERSISTENCE": "false",
+        "EXPO_PUBLIC_ENABLE_HOLD_WORKFLOW": "false",
+        "EXPO_PUBLIC_ENABLE_DELAY_PERSISTENCE": "false",
+        "EXPO_PUBLIC_ENABLE_HANDOFF_NOTES": "false",
+        "EXPO_PUBLIC_ENABLE_SECURE_TRANSITIONS": "false",
+        "EXPO_PUBLIC_ENABLE_TRAINING_TOOLS": "false"
+      },
       "ios": {
         "autoIncrement": true
       }

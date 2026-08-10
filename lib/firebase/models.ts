@@ -1,7 +1,7 @@
 import { Timestamp } from 'firebase/firestore';
 import type { OItemDoc } from '@/lib/operational-items/model';
 
-export type UserRole = 'admin' | 'qa' | 'operator' | 'packaging';
+export type UserRole = 'admin' | 'supervisor' | 'qa' | 'operator' | 'packaging';
 export type UserDepartment = 'thermal' | 'rtc' | 'qa' | 'packaging';
 
 export const PREP_STATUS_CONTRACT = [
@@ -26,8 +26,9 @@ export type ChillLogStatus = 'waiting' | 'running' | 'complete' | 'deviation';
 export type QACheckType = 'prep' | 'cook' | 'chill' | 'sanitation';
 export type QACheckStatus = 'ready_for_qa' | 'ready_for_packaging' | 'qa_hold' | 'qa_review_required';
 export type PackagingLogStatus = 'running' | 'complete' | 'deviation';
-export type AlertType = 'temp_issue' | 'late_load' | 'cleaning_missing';
-export type AlertSeverity = 'low' | 'medium' | 'high';
+export type AlertStatus = 'open' | 'acknowledged' | 'resolved';
+export type AlertSeverity = 'info' | 'warning' | 'critical';
+export type AlertCategory = 'equipment' | 'thermal' | 'chill' | 'qa' | 'packaging' | 'hold' | 'workflow';
 
 export interface UserDoc {
   name: string;
@@ -378,11 +379,108 @@ export interface PackagingLogDoc {
 }
 
 export interface AlertDoc {
-  type: AlertType;
+  alertId: string;
+  itemId: string;
+  batchId?: string | null;
+  conditionKey: string;
+  category: AlertCategory;
+  stage: string;
+  title: string;
   message: string;
   severity: AlertSeverity;
+  status: AlertStatus;
   createdAt: Timestamp;
-  resolved: boolean;
+  firstDetectedAt: Timestamp;
+  lastDetectedAt: Timestamp;
+  acknowledgedAt?: Timestamp | null;
+  acknowledgedBy?: string | null;
+  acknowledgedByName?: string | null;
+  resolvedAt?: Timestamp | null;
+  resolvedBy?: string | null;
+  resolvedByName?: string | null;
+  resolutionReason?: string | null;
+  occurrence: number;
+}
+
+export type AlertEventAction = 'created' | 'reopened' | 'acknowledged' | 'auto_resolved' | 'resolved';
+
+export interface AlertEventDoc {
+  alertId: string;
+  itemId: string;
+  action: AlertEventAction;
+  actorId: string;
+  actorName: string;
+  at: Timestamp;
+  reason?: string | null;
+}
+
+export type HoldReasonKey = 'qa_review' | 'process_deviation' | 'equipment_issue' | 'product_condition' | 'documentation' | 'supervisor_decision' | 'other';
+export type HoldResolutionOutcome = 'released_to_production';
+
+export interface HoldState {
+  reasonKey: HoldReasonKey;
+  reasonLabel: string;
+  notes?: string | null;
+  placedBy: string;
+  placedByName: string;
+  placedAt: Timestamp;
+  previousStage: string;
+  previousStatus: string;
+}
+
+export interface HoldEventDoc {
+  itemId: string;
+  action: 'placed' | 'reviewed' | 'resolved' | 'released';
+  actorId: string;
+  actorName: string;
+  at: Timestamp;
+  reasonKey?: HoldReasonKey | null;
+  reasonLabel?: string | null;
+  notes?: string | null;
+  outcome?: HoldResolutionOutcome | null;
+}
+
+export type DelayStatus = 'active' | 'cleared';
+export interface DelayDoc {
+  delayId: string;
+  itemId: string;
+  batchId?: string | null;
+  stage: string;
+  reasonKey: string;
+  reasonLabel: string;
+  notes?: string | null;
+  status: DelayStatus;
+  startedAt: Timestamp;
+  startedBy: string;
+  startedByName: string;
+  clearedAt?: Timestamp | null;
+  clearedBy?: string | null;
+  clearedByName?: string | null;
+  durationMinutes?: number | null;
+  occurrence: number;
+}
+
+export interface DelayEventDoc {
+  delayId: string;
+  itemId: string;
+  action: 'started' | 'reopened' | 'cleared';
+  actorId: string;
+  actorName: string;
+  at: Timestamp;
+  reasonKey?: string | null;
+  reasonLabel?: string | null;
+  notes?: string | null;
+  durationMinutes?: number | null;
+}
+
+export interface HandoffNoteDoc {
+  handoffId: string;
+  shiftDate: string;
+  note: string;
+  authorId: string;
+  authorName: string;
+  createdAt: Timestamp;
+  itemIds: string[];
 }
 
 // ── Product Intelligence (operational rules engine) ──────────────────────────
@@ -464,6 +562,8 @@ export interface OperationalEventDoc {
   severity: OperationalEventSeverity;
   notes: string;
   operator: string;                // operator/supervisor name
+  actorId?: string;                // authenticated uid; required for new writes
+  action?: string;
   /** Optional planned vs actual minutes (for delay / cook_overrun). */
   plannedMinutes?: number | null;
   actualMinutes?: number | null;
@@ -473,6 +573,7 @@ export interface OperationalEventDoc {
   resolved?: boolean;
   resolvedAt?: Timestamp | null;
   resolvedBy?: string | null;
+  resolvedByName?: string | null;
   createdAt: Timestamp;
 }
 
@@ -488,6 +589,11 @@ export type C3SCollections = {
   qa_checks: QACheckDoc;
   packaging_logs: PackagingLogDoc;
   alerts: AlertDoc;
+  alert_events: AlertEventDoc;
+  hold_events: HoldEventDoc;
+  delays: DelayDoc;
+  delay_events: DelayEventDoc;
+  handoff_notes: HandoffNoteDoc;
   weekly_plan: WeeklyPlanDoc;
   operational_events: OperationalEventDoc;
   operational_items: OItemDoc;

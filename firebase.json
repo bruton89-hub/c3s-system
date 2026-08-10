@@ -2,5 +2,7 @@
   "firestore": {
     "rules": "firestore.rules",
     "indexes": "firestore.indexes.json"
-  }
+  },
+  "functions": { "source": "functions" },
+  "emulators": { "firestore": { "port": 8085 }, "auth": { "port": 9099 }, "functions": { "port": 5002 }, "ui": { "enabled": false } }
 }

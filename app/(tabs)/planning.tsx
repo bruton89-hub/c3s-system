@@ -14,8 +14,9 @@
  * Optimized for iPad landscape: horizontal scroll between days, dense rows,
  * 44pt minimum touch targets on interactive elements.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
+import { getActiveStressScenario } from '@/lib/stress/scenarios';
 import {
   ActivityIndicator,
   Alert,
@@ -31,16 +32,14 @@ import { router } from 'expo-router';
 import { Timestamp, deleteDoc, getDoc } from 'firebase/firestore';
 
 import { C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
-import { C3S_COLORS, C3S_RADIUS, C3S_SPACING, C3S_TYPE } from '@/constants/c3s-ui';
+import { StressScenarioBanner } from '@/components/stress-scenario-banner';
+import { C3SOperatorFocus } from '@/components/operator-ui';
+import { C3S_COLORS, C3S_RADIUS } from '@/constants/c3s-ui';
 
 import {
-  assignSmokehouseToPrep,
   createWeeklyPlanItem,
   deleteWeeklyPlanItem,
   getWeeklyPlanItems,
-  markReadyForThermal,
-  startCookFromPrep,
-  startPrep,
   updateWeeklyPlanItem,
   type WeeklyPlanItem,
 } from '@/lib/firebase/repository';
@@ -75,19 +74,18 @@ import { toSafeDate } from '@/lib/utils/dates';
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
-type DayShort = (typeof DAY_NAMES)[number];
 
 const BOARD_STATUSES: { value: ProductionBoardStatus; label: string; color: string }[] = [
-  { value: 'planned',            label: 'Planned',            color: '#546E7A' },
-  { value: 'rtc',                label: 'RTC',                color: '#1565C0' },
-  { value: 'ready_for_thermal',  label: 'RDY → Thermal',      color: '#1976D2' },
-  { value: 'cooking',            label: 'Cooking',            color: '#FB8C00' },
-  { value: 'awaiting_chill',     label: 'Await Chill',        color: '#FFA726' },
-  { value: 'chill_running',      label: 'Chill Running',      color: '#4FC3F7' },
-  { value: 'ready_for_qa',       label: 'RDY → QA',           color: '#AB47BC' },
-  { value: 'ready_for_packaging',label: 'RDY → Pack',         color: '#66BB6A' },
-  { value: 'complete',           label: 'Complete',           color: '#388E3C' },
-  { value: 'deviation',          label: 'Deviation',          color: '#EF5350' },
+  { value: 'planned',            label: 'Planned',            color: C3S_COLORS.textMuted },
+  { value: 'rtc',                label: 'RTC',                color: C3S_COLORS.accent },
+  { value: 'ready_for_thermal',  label: 'RDY → Thermal',      color: C3S_COLORS.accent },
+  { value: 'cooking',            label: 'Cooking',            color: C3S_COLORS.warning },
+  { value: 'awaiting_chill',     label: 'Await Chill',        color: C3S_COLORS.warning },
+  { value: 'chill_running',      label: 'Chill Running',      color: C3S_COLORS.info },
+  { value: 'ready_for_qa',       label: 'RDY → QA',           color: C3S_COLORS.accent },
+  { value: 'ready_for_packaging',label: 'RDY → Pack',         color: C3S_COLORS.success },
+  { value: 'complete',           label: 'Complete',           color: C3S_COLORS.success },
+  { value: 'deviation',          label: 'Deviation',          color: C3S_COLORS.danger },
 ];
 
 function statusMeta(s: ProductionBoardStatus | undefined) {
@@ -181,6 +179,13 @@ export default function PlanningScreen() {
     setLoading(true);
     setProfilesLoading(true);
     setError(null);
+    if (getActiveStressScenario()) {
+      setProfiles([]);
+      setItems([]);
+      setProfilesLoading(false);
+      setLoading(false);
+      return;
+    }
     // Use allSettled so a weekly_plan permission failure never blocks
     // product_profiles from reaching the modal — they are independent fetches.
     const [profilesResult, itemsResult] = await Promise.allSettled([
@@ -190,7 +195,7 @@ export default function PlanningScreen() {
     if (profilesResult.status === 'fulfilled') {
       setProfiles(profilesResult.value);
     } else if (__DEV__) {
-      // eslint-disable-next-line no-console
+
       console.error('[load] getActiveProductProfiles failed:', profilesResult.reason);
     }
     setProfilesLoading(false);
@@ -200,7 +205,7 @@ export default function PlanningScreen() {
       const reason = itemsResult.reason;
       setError(reason instanceof Error ? reason.message : 'Failed to load planning data');
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.error('[load] getWeeklyPlanItems failed:', reason);
       }
     }
@@ -433,14 +438,14 @@ export default function PlanningScreen() {
       const planId = item.id;
       if (!planId) throw new Error('Missing weekly_plan document id.');
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.log('[Planning->RTC] selected plan id:', planId);
       }
       const { prepId: prepQueueId, oItemId } = await oItemSendPlanToRTC(planId);
       const planSnap = await getDoc(docRef('weekly_plan', planId));
       const planData = planSnap.exists() ? planSnap.data() : null;
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.log('[Planning->RTC] oItemSendPlanToRTC success:', {
           planId,
           createdPrepQueueId: prepQueueId,
@@ -456,7 +461,7 @@ export default function PlanningScreen() {
         const prepSnap = await getDoc(docRef('prep_queue', prepQueueId));
         prepVerified = prepSnap.exists();
         const prepData = prepSnap.exists() ? prepSnap.data() : null;
-        // eslint-disable-next-line no-console
+
         console.log('[Planning->RTC] verification read:', {
           exists: prepVerified,
           prepId: prepQueueId,
@@ -559,6 +564,13 @@ export default function PlanningScreen() {
             </View>
           }
         />
+        <StressScenarioBanner />
+        <C3SOperatorFocus
+          status={`${items.length} planned batches this week`}
+          action={capacityWarnings.warnings.length > 0 ? 'Review Capacity Risk' : items.some((item) => item.status === 'planned') ? 'Send to RTC' : 'Review Production Plan'}
+          detail="Add or edit a batch only when the weekly plan needs to change."
+          tone={capacityWarnings.warnings.length > 0 ? 'critical' : items.length > 0 ? 'active' : 'complete'}
+        />
 
         {capacityWarnings.warnings.length > 0 && (
           <View style={styles.warningBar}>
@@ -633,26 +645,22 @@ export default function PlanningScreen() {
                 <Text style={styles.devBtnText}>Send Latest Test Plan to RTC</Text>
               </Pressable>
               <Pressable style={styles.devBtn} onPress={() => runFlowAction('Start Prep', async () => {
-                if (!flowTestPrepId) throw new Error('No linked prep row.');
-                await startPrep(flowTestPrepId);
+                throw new Error('Direct DEV transitions were removed. Continue from the RTC screen.');
               })}>
                 <Text style={styles.devBtnText}>Start Prep</Text>
               </Pressable>
               <Pressable style={styles.devBtn} onPress={() => runFlowAction('Mark Ready for Thermal', async () => {
-                if (!flowTestPrepId) throw new Error('No linked prep row.');
-                await markReadyForThermal(flowTestPrepId);
+                throw new Error('Direct DEV transitions were removed. Continue from the RTC screen.');
               })}>
                 <Text style={styles.devBtnText}>Mark Ready for Thermal</Text>
               </Pressable>
               <Pressable style={styles.devBtn} onPress={() => runFlowAction('Assign Smokehouse D', async () => {
-                if (!flowTestPrepId) throw new Error('No linked prep row.');
-                await assignSmokehouseToPrep(flowTestPrepId, 'D');
+                throw new Error('Direct DEV transitions were removed. Continue from the Thermal screen.');
               })}>
                 <Text style={styles.devBtnText}>Assign Smokehouse D</Text>
               </Pressable>
               <Pressable style={styles.devBtn} onPress={() => runFlowAction('Start Cook', async () => {
-                if (!flowTestPrepId) throw new Error('No linked prep row.');
-                await startCookFromPrep(flowTestPrepId, 'D', { startingTemp: 165 });
+                throw new Error('Direct DEV transitions were removed. Continue from the Thermal screen.');
               })}>
                 <Text style={styles.devBtnText}>Start Cook</Text>
               </Pressable>
@@ -1189,52 +1197,52 @@ const styles = StyleSheet.create({
     minHeight: 36,
     justifyContent: 'center',
   },
-  navBtnAccent: { backgroundColor: '#1565C0', borderColor: '#1565C0' },
+  navBtnAccent: { backgroundColor: C3S_COLORS.accent, borderColor: C3S_COLORS.accent },
   navBtnText: { color: C3S_COLORS.textStrong, fontSize: 12, fontWeight: '700' },
 
   warningBar: {
-    borderWidth: 1, borderColor: '#7A2E2E',
-    backgroundColor: '#1f1212',
+    borderWidth: 1, borderColor: C3S_COLORS.danger,
+    backgroundColor: C3S_COLORS.dangerSoft,
     borderRadius: C3S_RADIUS.card,
     paddingHorizontal: 10, paddingVertical: 8,
     marginBottom: 10,
   },
-  warningTitle: { color: '#FFB4B4', fontSize: 12, fontWeight: '800', marginBottom: 4 },
+  warningTitle: { color: C3S_COLORS.danger, fontSize: 12, fontWeight: '800', marginBottom: 4 },
   warningRow: { gap: 6 },
   warningChip: {
     borderRadius: C3S_RADIUS.chip,
-    borderWidth: 1, borderColor: '#7A2E2E',
-    backgroundColor: '#2a1414',
+    borderWidth: 1, borderColor: C3S_COLORS.danger,
+    backgroundColor: C3S_COLORS.dangerSoft,
     paddingHorizontal: 8, paddingVertical: 4,
   },
-  warningChipHigh: { borderColor: C3S_COLORS.danger, backgroundColor: '#3a1818' },
-  warningChipText: { color: '#FFB4B4', fontSize: 11, fontWeight: '600' },
+  warningChipHigh: { borderColor: C3S_COLORS.danger, backgroundColor: C3S_COLORS.dangerSoft },
+  warningChipText: { color: C3S_COLORS.danger, fontSize: 11, fontWeight: '600' },
 
   error: { color: C3S_COLORS.danger, fontSize: 12, marginBottom: 6 },
-  infoMsg: { color: '#9FD3FF', fontSize: 12, marginBottom: 6 },
+  infoMsg: { color: C3S_COLORS.accent, fontSize: 12, marginBottom: 6 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   devPanel: {
     borderWidth: 1,
-    borderColor: '#2F6D8A',
-    backgroundColor: '#111923',
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.panelAlt,
     borderRadius: C3S_RADIUS.card,
     padding: 10,
     marginBottom: 10,
     gap: 6,
   },
-  devTitle: { color: '#9FD3FF', fontSize: 12, fontWeight: '800' },
+  devTitle: { color: C3S_COLORS.accent, fontSize: 12, fontWeight: '800' },
   devBtnRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   devBtn: {
-    backgroundColor: '#13314A',
+    backgroundColor: C3S_COLORS.accentSoft,
     borderWidth: 1,
-    borderColor: '#2F6D8A',
+    borderColor: C3S_COLORS.accent,
     borderRadius: 6,
     paddingHorizontal: 8,
     paddingVertical: 6,
   },
-  devBtnDanger: { backgroundColor: '#3A1818', borderColor: '#7A2E2E' },
-  devBtnText: { color: '#E6EDF3', fontSize: 11, fontWeight: '700' },
-  devStatus: { color: '#AAB4BE', fontSize: 11, fontFamily: 'Menlo' },
+  devBtnDanger: { backgroundColor: C3S_COLORS.dangerSoft, borderColor: C3S_COLORS.danger },
+  devBtnText: { color: C3S_COLORS.accent, fontSize: 11, fontWeight: '800' },
+  devStatus: { color: C3S_COLORS.textMuted, fontSize: 11, fontFamily: 'Menlo' },
 
   weekRow: { gap: 8, paddingBottom: 12 },
   dayColumn: {
@@ -1270,7 +1278,7 @@ const styles = StyleSheet.create({
   sectionTitle: { color: C3S_COLORS.textPrimary, fontSize: 12, fontWeight: '800', letterSpacing: 0.3 },
   addBtn: {
     width: 28, height: 28, borderRadius: 14,
-    backgroundColor: '#1565C0',
+    backgroundColor: C3S_COLORS.accent,
     alignItems: 'center', justifyContent: 'center',
   },
   addBtnText: { color: C3S_COLORS.textStrong, fontSize: 16, fontWeight: '800' },
@@ -1316,7 +1324,7 @@ const styles = StyleSheet.create({
     borderColor: C3S_COLORS.border,
   },
   cardBtnDisabled: { opacity: 0.55 },
-  cardBtnDanger: { flex: 0, paddingHorizontal: 10, backgroundColor: '#3a1818', borderColor: '#7A2E2E' },
+  cardBtnDanger: { flex: 0, paddingHorizontal: 10, backgroundColor: C3S_COLORS.dangerSoft, borderColor: C3S_COLORS.danger },
   cardBtnText: { color: C3S_COLORS.textPrimary, fontSize: 11, fontWeight: '700' },
 
   totalsBox: {
@@ -1363,7 +1371,7 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: C3S_COLORS.border,
     minWidth: 88, alignItems: 'center',
   },
-  modalBtnPrimary: { backgroundColor: '#1565C0', borderColor: '#1565C0' },
+  modalBtnPrimary: { backgroundColor: C3S_COLORS.accent, borderColor: C3S_COLORS.accent },
   modalBtnText: { color: C3S_COLORS.textStrong, fontSize: 13, fontWeight: '700' },
 
   productPicker: {
@@ -1373,7 +1381,7 @@ const styles = StyleSheet.create({
     backgroundColor: C3S_COLORS.bg,
   },
   productOption: { paddingHorizontal: 10, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: C3S_COLORS.border },
-  productOptionSelected: { backgroundColor: '#0d2a4f' },
+  productOptionSelected: { backgroundColor: C3S_COLORS.accentSoft },
   productOptionText: { color: C3S_COLORS.textPrimary, fontSize: 12 },
   productOptionTextSelected: { color: C3S_COLORS.textStrong, fontWeight: '800' },
 
@@ -1385,7 +1393,7 @@ const styles = StyleSheet.create({
     backgroundColor: C3S_COLORS.bg,
     minWidth: 36, alignItems: 'center',
   },
-  pickerChipSelected: { backgroundColor: '#1565C0', borderColor: '#1565C0' },
+  pickerChipSelected: { backgroundColor: C3S_COLORS.accent, borderColor: C3S_COLORS.accent },
   pickerChipText: { color: C3S_COLORS.textMuted, fontSize: 11, fontWeight: '700' },
   pickerChipTextSelected: { color: C3S_COLORS.textStrong },
 });

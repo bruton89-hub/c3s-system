@@ -9,6 +9,7 @@
  *   consume with const { status, user, signInWithEmail, signOutUser } = useAuth();
  */
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import Constants from 'expo-constants';
 import {
   onAuthStateChanged,
   signInAnonymously,
@@ -16,8 +17,11 @@ import {
   signOut,
   type User,
 } from 'firebase/auth';
+import { getDoc } from 'firebase/firestore';
 
 import { auth, firebaseConfigError, firebaseInitError, firebaseInitialized, firebaseReady } from '@/lib/firebase/config';
+import { docRef } from '@/lib/firebase/collections';
+import type { UserDoc } from '@/lib/firebase/models';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -27,6 +31,8 @@ export type AuthContextValue = {
   status: AuthStatus;
   user: User | null;
   isAnonymous: boolean;
+  profile: UserDoc | null;
+  profileLoading: boolean;
   startupError: string | null;
   signInWithEmail: (email: string, password: string) => Promise<void>;
   signOutUser: () => Promise<void>;
@@ -36,6 +42,8 @@ const AuthContext = createContext<AuthContextValue>({
   status: 'loading',
   user: null,
   isAnonymous: false,
+  profile: null,
+  profileLoading: false,
   startupError: null,
   signInWithEmail: async () => {},
   signOutUser: async () => {},
@@ -47,11 +55,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('loading');
   const [user, setUser] = useState<User | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
+  const [profile, setProfile] = useState<UserDoc | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
 
   // Prevent auto-anon re-trigger after an explicit sign-out.
   const suppressAutoAnon = useRef(false);
   // Prevent concurrent anon sign-in attempts while one is in flight.
   const tryingAnon = useRef(false);
+  const disableAnonymousAuth = Boolean((Constants.expoConfig?.extra as Record<string, unknown> | null | undefined)?.disableAnonymousAuth)
+    || process.env.EXPO_PUBLIC_DISABLE_ANONYMOUS_AUTH === 'true';
 
   useEffect(() => {
     // Guard 1 — env vars missing.
@@ -79,6 +91,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setUser(firebaseUser);
         setStatus('signed-in');
         tryingAnon.current = false;
+        setProfileLoading(true);
+        void getDoc(docRef('users', firebaseUser.uid))
+          .then((profileSnap) => setProfile(profileSnap.exists() ? profileSnap.data() : null))
+          .catch(() => setProfile(null))
+          .finally(() => setProfileLoading(false));
 
         if (__DEV__) {
           // eslint-disable-next-line no-console
@@ -92,7 +109,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       // No user — attempt automatic anonymous sign-in on first load.
-      if (!suppressAutoAnon.current && !tryingAnon.current) {
+      if (!disableAnonymousAuth && !suppressAutoAnon.current && !tryingAnon.current) {
         tryingAnon.current = true;
         try {
           if (__DEV__) {
@@ -115,12 +132,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       } else {
         // Explicit sign-out path — stay on sign-in screen.
         setUser(null);
+        setProfile(null);
         setStatus('signed-out');
       }
     });
 
     return unsubscribe;
-  }, []);
+  }, [disableAnonymousAuth]);
 
   const signInWithEmail = async (email: string, password: string): Promise<void> => {
     if (!firebaseReady || !firebaseInitialized || !auth) {
@@ -137,7 +155,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (!firebaseReady || !firebaseInitialized || !auth) return;
     suppressAutoAnon.current = true;
     await signOut(auth);
-    setUser(null);
+      setUser(null);
+      setProfile(null);
     setStatus('signed-out');
   };
 
@@ -147,6 +166,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         status,
         user,
         isAnonymous: user?.isAnonymous ?? false,
+        profile,
+        profileLoading,
         startupError,
         signInWithEmail,
         signOutUser,

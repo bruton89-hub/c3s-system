@@ -11,10 +11,75 @@ service cloud.firestore {
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "supervisor"];
     }
 
+    function userProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isActiveRole(roles) {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        userProfile().active == true && userProfile().role in roles;
+    }
+
+    function canAcknowledgeAlert() {
+      return isActiveRole(["admin", "supervisor", "qa", "operator", "packaging"]);
+    }
+
+    function canPlaceHold() {
+      return isActiveRole(["admin", "supervisor", "qa", "operator", "packaging"]);
+    }
+
+    function canResolveHold() {
+      return isActiveRole(["admin", "supervisor", "qa"]);
+    }
+
+    function canRecordOperations() {
+      return isActiveRole(["admin", "supervisor", "qa", "operator", "packaging"]);
+    }
+
+    function canPlan() { return isActiveRole(["admin", "supervisor"]); }
+    function canRunProduction() { return isActiveRole(["admin", "supervisor", "operator"]); }
+    function canRunQA() { return isActiveRole(["admin", "supervisor", "qa"]); }
+    function canRunPackaging() { return isActiveRole(["admin", "supervisor", "packaging"]); }
+
+    function validProductionTransition(fromStatus, toStatus) {
+      return
+        (fromStatus == "draft" && toStatus == "staging") ||
+        (fromStatus == "staging" && toStatus in ["staged", "prepping", "ready"]) ||
+        (fromStatus == "staged" && toStatus in ["prepping", "ready"]) ||
+        (fromStatus == "prepping" && toStatus in ["ready", "ready_for_thermal"]) ||
+        (fromStatus == "ready" && toStatus in ["ready_for_thermal", "assigned"]) ||
+        (fromStatus == "ready_for_thermal" && toStatus == "assigned") ||
+        (fromStatus == "in_thermal" && toStatus in ["assigned", "cooking"]) ||
+        (fromStatus == "moved_downstream" && toStatus in ["assigned", "ready_for_thermal"]) ||
+        (fromStatus == "assigned" && toStatus == "cooking") ||
+        (fromStatus == "cooking" && toStatus == "awaiting_chill") ||
+        (fromStatus == "awaiting_chill" && toStatus == "in_chill") ||
+        (fromStatus == "in_chill" && toStatus == "chill_complete") ||
+        (fromStatus == "chill_complete" && toStatus == "ready_for_qa") ||
+        (fromStatus == "ready_for_qa" && toStatus in ["ready_for_packaging", "qa_hold", "qa_review_required"]) ||
+        (fromStatus in ["qa_hold", "qa_review_required"] && toStatus == "ready_for_qa") ||
+        (fromStatus == "ready_for_packaging" && toStatus == "packaging_in_progress") ||
+        (fromStatus == "packaging_in_progress" && toStatus == "packaging_complete") ||
+        (fromStatus == "packaging_complete" && toStatus == "complete");
+    }
+
+    function statusMatchesStage(status, stage) {
+      return
+        (status == "draft" && stage == "planning") ||
+        (status in ["staging", "staged", "prepping", "ready"] && stage == "rtc") ||
+        (status in ["ready_for_thermal", "split_parent", "in_thermal", "moved_downstream", "assigned", "cooking"] && stage == "thermal") ||
+        (status in ["awaiting_chill", "in_chill", "chill_complete"] && stage == "chill") ||
+        (status in ["ready_for_qa", "qa_hold", "qa_review_required", "ready_for_packaging"] && stage == "qa") ||
+        (status == "packaging_in_progress" && stage == "packaging") ||
+        (status in ["packaging_complete", "complete"] && stage == "complete");
+    }
+
     match /users/{userId} {
       allow read: if signedIn();
-      allow create: if signedIn() && request.auth.uid == userId;
-      allow update: if (signedIn() && request.auth.uid == userId) || isAdmin();
+      allow create: if isAdmin();
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == userId &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name"]));
       allow delete: if isAdmin();
     }
 
@@ -24,44 +89,143 @@ service cloud.firestore {
     }
 
     match /weekly_plan/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow create: if canPlan() && request.resource.data.createdAt == request.time;
+      allow update: if canPlan() && !request.resource.data.diff(resource.data).affectedKeys().hasAny(["createdAt", "createdBy", "status", "boardStatus", "linkedPrepQueueId", "rtcPrepId"]);
+      allow delete: if canPlan();
     }
 
     match /prep_queue/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow write: if false;
     }
 
     match /smokehouses/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow create: if isActiveRole(["admin", "supervisor"]) && request.resource.data.status == "idle" && request.resource.data.currentLoadId == null;
+      allow update: if isActiveRole(["admin", "supervisor"]) && request.resource.data.name == resource.data.name && request.resource.data.status == resource.data.status && request.resource.data.currentLoadId == resource.data.currentLoadId && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["lastCleanedAt", "setupType", "capacity"]);
+      allow delete: if false;
     }
 
     match /chill_logs/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow write: if false;
     }
 
     match /chillers/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow create: if isActiveRole(["admin", "supervisor"]) && request.resource.data.status == "idle" && request.resource.data.currentLoadId == null;
+      allow update: if isActiveRole(["admin", "supervisor"]) && request.resource.data.name == resource.data.name && request.resource.data.status == resource.data.status && request.resource.data.currentLoadId == resource.data.currentLoadId && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["capacity", "setupType"]);
+      allow delete: if false;
     }
 
     match /qa_checks/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow write: if false;
     }
 
     match /packaging_logs/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow write: if false;
     }
 
     match /operational_events/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow write: if false;
     }
 
     match /alerts/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow create: if canAcknowledgeAlert() &&
+        request.resource.data.alertId == docId && request.resource.data.status == "open" &&
+        request.resource.data.createdAt == request.time &&
+        request.resource.data.firstDetectedAt == request.time &&
+        request.resource.data.lastDetectedAt == request.time;
+      allow update: if
+        (canAcknowledgeAlert() && resource.data.status == "open" &&
+          request.resource.data.status == "acknowledged" &&
+          request.resource.data.acknowledgedBy == request.auth.uid &&
+          request.resource.data.acknowledgedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "status", "acknowledgedAt", "acknowledgedBy", "acknowledgedByName"
+          ])) ||
+        (canResolveHold() && request.resource.data.status == "resolved" &&
+          request.resource.data.resolvedBy == request.auth.uid &&
+          request.resource.data.resolvedAt == request.time &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "status", "resolvedAt", "resolvedBy", "resolvedByName", "resolutionReason"
+          ])) ||
+        (canAcknowledgeAlert() && request.resource.data.alertId == resource.data.alertId &&
+          request.resource.data.itemId == resource.data.itemId &&
+          request.resource.data.conditionKey == resource.data.conditionKey &&
+          request.resource.data.lastDetectedAt == request.time &&
+          (request.resource.data.status == resource.data.status ||
+            (resource.data.status == "resolved" && request.resource.data.status == "open")) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "category", "stage", "title", "message", "severity", "status", "lastDetectedAt",
+            "firstDetectedAt", "acknowledgedAt", "acknowledgedBy", "acknowledgedByName",
+            "resolvedAt", "resolvedBy", "resolvedByName", "resolutionReason", "occurrence"
+          ]));
+      allow delete: if false;
+    }
+
+    match /alert_events/{docId} {
+      allow read: if signedIn();
+      allow create: if canAcknowledgeAlert() &&
+        request.resource.data.actorId == request.auth.uid && request.resource.data.at == request.time;
+      allow update, delete: if false;
+    }
+
+    match /hold_events/{docId} {
+      allow read: if signedIn();
+      allow create: if request.resource.data.actorId == request.auth.uid &&
+        request.resource.data.at == request.time &&
+        ((request.resource.data.action == "placed" && canPlaceHold()) ||
+         (request.resource.data.action in ["reviewed", "resolved", "released"] && canResolveHold()));
+      allow update, delete: if false;
+    }
+
+    match /delays/{docId} {
+      allow read: if signedIn();
+      allow create: if canRecordOperations() && request.resource.data.delayId == docId &&
+        request.resource.data.status == "active" && request.resource.data.startedBy == request.auth.uid &&
+        request.resource.data.startedAt == request.time && request.resource.data.clearedAt == null &&
+        request.resource.data.clearedBy == null && request.resource.data.durationMinutes == null &&
+        request.resource.data.occurrence == 1;
+      allow update: if canRecordOperations() && request.resource.data.delayId == resource.data.delayId &&
+        request.resource.data.itemId == resource.data.itemId && request.resource.data.stage == resource.data.stage &&
+        ((resource.data.status == "active" && request.resource.data.status == "cleared" &&
+          request.resource.data.clearedBy == request.auth.uid && request.resource.data.clearedAt == request.time &&
+          request.resource.data.occurrence == resource.data.occurrence &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["status", "clearedAt", "clearedBy", "clearedByName", "durationMinutes"])) ||
+         (resource.data.status == "cleared" && request.resource.data.status == "active" &&
+          request.resource.data.startedBy == request.auth.uid && request.resource.data.startedAt == request.time &&
+          request.resource.data.clearedAt == null && request.resource.data.clearedBy == null && request.resource.data.durationMinutes == null &&
+          request.resource.data.occurrence == resource.data.occurrence + 1 &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(["batchId", "reasonKey", "reasonLabel", "notes", "status", "startedAt", "startedBy", "startedByName", "clearedAt", "clearedBy", "clearedByName", "durationMinutes", "occurrence"])));
+      allow delete: if false;
+    }
+
+    match /delay_events/{docId} {
+      allow read: if signedIn();
+      allow create: if canRecordOperations() && request.resource.data.actorId == request.auth.uid && request.resource.data.at == request.time;
+      allow update, delete: if false;
+    }
+
+    match /handoff_notes/{docId} {
+      allow read: if signedIn();
+      allow create: if canRecordOperations() && request.resource.data.authorId == request.auth.uid &&
+        request.resource.data.createdAt == request.time && request.resource.data.note is string &&
+        request.resource.data.note.size() > 0 && request.resource.data.note.size() <= 500 &&
+        request.resource.data.itemIds is list && request.resource.data.itemIds.size() <= 25;
+      allow update, delete: if false;
     }
 
     // cook_logs — written by thermal operations, read by thermal/chill/QA screens.
     match /cook_logs/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow create: if canRunProduction();
+      allow update, delete: if false;
     }
 
     // products — legacy master-list collection (separate from product_profiles).
@@ -71,9 +235,15 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // operational_items — canonical state machine collection; any signed-in user may read/write.
+    // Canonical state machine. All writes are server-orchestrated; Admin SDK
+    // transactions authenticate, authorize, validate state, and append audit.
     match /operational_items/{docId} {
-      allow read, write: if signedIn();
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    match /mutation_receipts/{docId} {
+      allow read, write: if false;
     }
 
     match /{document=**} {

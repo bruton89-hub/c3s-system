@@ -22,12 +22,16 @@ import {
   limit,
   orderBy,
   query,
+  runTransaction,
+  serverTimestamp,
   Timestamp,
   updateDoc,
   where,
+  doc,
 } from 'firebase/firestore';
 
 import { collectionRef, docRef } from '@/lib/firebase/collections';
+import { auth, db } from '@/lib/firebase/config';
 import {
   // Original transition functions
   sendPlanToRTC,
@@ -60,10 +64,12 @@ import {
   updatePrepQueueAssignment,
   type ThermalDeviationInput,
 } from '@/lib/firebase/repository';
-import type { PrepQueueDoc, SmokehouseDoc } from '@/lib/firebase/models';
+import type { HoldEventDoc, HoldReasonKey, HoldResolutionOutcome, PrepQueueDoc, SmokehouseDoc } from '@/lib/firebase/models';
 
 import { buildTransitionRecord } from './transitions';
 import type { OItemDoc, OItemItem, OItemStage, OItemStatus } from './model';
+import { assertStressScenarioReadOnly, getActiveStressScenario } from '@/lib/stress/scenarios';
+import { serverExecuteProductionAction, serverPlaceFormalHold, serverResolveFormalHold, type ProductionAction } from '@/lib/security/callables';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -79,6 +85,56 @@ function smokehouseCapacityForSetup(setupType: SmokehouseDoc['setupType'] | unde
   return setupType === 'tree' ? 12 : 18;
 }
 
+function requireActor() {
+  const user = auth?.currentUser;
+  if (!user) throw new Error('Sign in is required for hold actions.');
+  return user;
+}
+
+function holdEventRef() {
+  return doc(collectionRef('hold_events'));
+}
+
+const recentRequestIds = new Map<string, { id: string; expiresAt: number }>();
+
+function secureRequestId(action: string, itemId: string, payload: Record<string, unknown> = {}): string {
+  const key = JSON.stringify({ action, itemId, payload });
+  const cached = recentRequestIds.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.id;
+  const id = `${action}_${itemId}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+  recentRequestIds.set(key, { id, expiresAt: Date.now() + 5 * 60_000 });
+  return id;
+}
+
+function stableHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+async function submitProductionAction(
+  action: ProductionAction,
+  itemId: string,
+  payload: Record<string, unknown> = {},
+  expected?: { stage: OItemStage; status: OItemStatus },
+) {
+  assertStressScenarioReadOnly();
+  const snap = await getDoc(oiRef(itemId));
+  if (!snap.exists()) throw new Error('Production item no longer exists. Refresh and try again.');
+  const item = snap.data();
+  const expectedStage = expected?.stage ?? item.stage;
+  const expectedStatus = expected?.status ?? item.status;
+  if (item.stage !== expectedStage || item.status !== expectedStatus) {
+    throw new Error(`Production state changed to ${item.stage}/${item.status}. Refresh before retrying.`);
+  }
+  const expectedUpdatedAt = item.updatedAt?.toMillis?.();
+  const requestId = secureRequestId(action, itemId, payload);
+  return serverExecuteProductionAction({ action, itemId, expectedStage, expectedStatus, expectedUpdatedAt, payload, requestId });
+}
+
 async function patchOItem(
   id: string,
   currentStage: OItemStage,
@@ -88,25 +144,25 @@ async function patchOItem(
   extra: Partial<OItemDoc> = {},
   reason?: string,
 ): Promise<void> {
-  const { record, toStage } = buildTransitionRecord(
-    { stage: currentStage, status: currentStatus },
-    toStatus,
-    by,
-    reason,
-  );
-  await updateDoc(oiRef(id), removeUndefined({
-    stage: toStage,
-    status: toStatus,
-    updatedAt: Timestamp.now(),
-    transitions: arrayUnion(record),
-    ...(extra as Record<string, unknown>),
-  }));
+  assertStressScenarioReadOnly();
+  const ref = oiRef(id);
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(ref);
+    if (!snapshot.exists()) throw new Error('Production item no longer exists. Refresh and try again.');
+    const authoritative = snapshot.data();
+    if (authoritative.stage !== currentStage || authoritative.status !== currentStatus) {
+      throw new Error(`Production state changed to ${authoritative.stage}/${authoritative.status}. Refresh before retrying.`);
+    }
+    const { record, toStage } = buildTransitionRecord({ stage: authoritative.stage, status: authoritative.status }, toStatus, by, reason);
+    transaction.update(ref, removeUndefined({ stage: toStage, status: toStatus, updatedAt: Timestamp.now(), transitions: arrayUnion(record), ...(extra as Record<string, unknown>) }));
+  });
 }
 
 async function patchOItemFields(
   id: string,
   fields: Partial<OItemDoc>,
 ): Promise<void> {
+  assertStressScenarioReadOnly();
   await updateDoc(oiRef(id), removeUndefined({
     ...fields as Record<string, unknown>,
     updatedAt: Timestamp.now(),
@@ -118,22 +174,57 @@ async function patchOItemFields(
 export async function getOperationalItems(filter?: {
   stage?: OItemStage;
 }): Promise<OItemItem[]> {
+  const stressScenario = getActiveStressScenario();
+  if (stressScenario) {
+    const selected = filter?.stage ? stressScenario.items.filter((item) => item.stage === filter.stage) : stressScenario.items;
+    return [...selected].sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
+  }
+  // A stage equality filter plus createdAt ordering requires a compound index.
+  // The stage result sets are small enough to sort locally, which keeps this
+  // optimized read usable before any index deployment and avoids a noisy
+  // fallback to downloading the entire collection.
   const base = filter?.stage
-    ? query(
-        collectionRef('operational_items'),
-        where('stage', '==', filter.stage),
-        orderBy('createdAt', 'desc'),
-      )
+    ? query(collectionRef('operational_items'), where('stage', '==', filter.stage))
     : query(collectionRef('operational_items'), orderBy('createdAt', 'desc'));
 
   const snapshot = await getDocs(base);
-  return snapshot.docs.map((d) => ({ id: d.id, ...d.data() })) as OItemItem[];
+  const items = snapshot.docs.map((d) => ({ id: d.id, ...d.data() })) as OItemItem[];
+  if (!filter?.stage) return items;
+  return items.sort((a, b) => (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0));
 }
 
 export async function getOperationalItem(id: string): Promise<OItemItem | null> {
+  const stressItem = getActiveStressScenario()?.items.find((item) => item.id === id);
+  if (stressItem) return stressItem;
   const snap = await getDoc(oiRef(id));
   if (!snap.exists()) return null;
   return { id: snap.id, ...snap.data() } as OItemItem;
+}
+
+export async function getHoldEvents(itemId: string): Promise<(HoldEventDoc & { id: string })[]> {
+  const snapshot = await getDocs(query(collectionRef('hold_events'), where('itemId', '==', itemId), orderBy('at', 'asc')));
+  return snapshot.docs.map((entry) => ({ id: entry.id, ...entry.data() }));
+}
+
+export async function placeOperationalItemOnHold(input: {
+  itemId: string;
+  reasonKey: HoldReasonKey;
+  reasonLabel: string;
+  notes?: string;
+  actorName: string;
+}): Promise<void> {
+  assertStressScenarioReadOnly();
+  await serverPlaceFormalHold({ ...input, requestId: secureRequestId('hold', input.itemId, { reasonKey: input.reasonKey, reasonLabel: input.reasonLabel, notes: input.notes || '' }) });
+}
+
+export async function resolveOperationalItemHold(input: {
+  itemId: string;
+  outcome: HoldResolutionOutcome;
+  explanation: string;
+  actorName: string;
+}): Promise<void> {
+  assertStressScenarioReadOnly();
+  await serverResolveFormalHold({ ...input, requestId: secureRequestId('resolve_hold', input.itemId, { outcome: input.outcome, explanation: input.explanation }) });
 }
 
 // ── Create ────────────────────────────────────────────────────────────────────
@@ -167,107 +258,26 @@ export async function createOperationalItem(
  */
 export async function oItemSendPlanToRTC(
   planId: string,
-  by = 'system',
+  _by = 'system',
 ): Promise<{ prepId: string; oItemId: string }> {
-  const prepId = await sendPlanToRTC(planId);
-
-  // Read the freshly-created prep_queue doc for its snapshot fields.
-  const prepSnap = await getDoc(docRef('prep_queue', prepId));
-  if (!prepSnap.exists()) throw new Error('Created prep_queue doc not found.');
-  const prep = prepSnap.data();
-
-  const now = Timestamp.now();
-  const initStatus: OItemStatus = (prep.status as OItemStatus) ?? 'staging';
-
-  const oItemId = await createOperationalItem({
-    productId: prep.productId ?? '',
-    productName: prep.productNameSnapshot || prep.productName || '',
-    productNameSnapshot: prep.productNameSnapshot || prep.productName || '',
-    productCode: prep.productCodeSnapshot ?? prep.productCode,
-    productCodeSnapshot: prep.productCodeSnapshot ?? prep.productCode,
-    racks: prep.racks ?? 0,
-    pieces: prep.pieces ?? 0,
-    cases: prep.cases,
-    poNumber: prep.poNumber ?? '',
-    deliveryDate: prep.deliveryDate ?? '',
-    makeDate: prep.makeDate ?? '',
-    cookType: prep.cookType ?? '',
-    targetTemp: prep.targetTemp ?? 0,
-    expectedCookMinutes: prep.expectedCookMinutes ?? 0,
-    expectedChillMinutes: prep.expectedChillMinutes,
-    expectedPackMinutes: prep.expectedPackMinutes,
-    rackType: prep.rackType ?? '',
-    species: prep.species ?? '',
-    packagingType: prep.packagingType ?? '',
-    thermalOwner: prep.thermalOwner ?? '',
-    criticalLimit: prep.criticalLimit,
-    stage: 'rtc',
-    status: initStatus,
-    weeklyPlanId: planId,
-    prepQueueId: prepId,
-    sourcePlanId: planId,
-    startTime: prep.startTime ?? now,
-    assignedSmokehouse: prep.assignedSmokehouse ?? null,
-    processOrder: prep.processOrder,
-    plannedDate: prep.plannedDate,
-    department: prep.department,
-    targetSmokehouseId: prep.targetSmokehouseId,
-    targetChillerId: prep.targetChillerId,
-    expectedCookComplete: prep.expectedCookComplete,
-    expectedChillComplete: prep.expectedChillComplete,
-    packagingReadyETA: prep.packagingReadyETA,
-    createdBy: prep.createdBy,
-  });
-
-  return { prepId, oItemId };
+  assertStressScenarioReadOnly();
+  const requestId = `rtc_send_${planId}_${stableHash(planId)}`.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128);
+  const result = await serverExecuteProductionAction({ action: 'rtc_send_to_queue', planId, requestId });
+  if (!result.prepId || !result.oItemId) throw new Error('RTC handoff returned an incomplete canonical result.');
+  return { prepId: result.prepId, oItemId: result.oItemId };
 }
 
-/**
- * Create an OItem for a manually-entered prep item (no weekly_plan origin).
- * Called after `createPrepQueueItem()` returns the new prepId.
- */
-export async function oItemCreateManual(
-  prepId: string,
-  by = 'system',
-): Promise<string> {
-  const prepSnap = await getDoc(docRef('prep_queue', prepId));
-  if (!prepSnap.exists()) throw new Error('Prep queue doc not found after creation.');
-  const prep = prepSnap.data();
-  const now = Timestamp.now();
-  const initStatus: OItemStatus = (prep.status as OItemStatus) ?? 'staging';
-
-  return createOperationalItem({
-    productId: prep.productId ?? '',
-    productName: prep.productNameSnapshot || prep.productName || '',
-    productNameSnapshot: prep.productNameSnapshot || prep.productName || '',
-    productCode: prep.productCodeSnapshot ?? prep.productCode,
-    productCodeSnapshot: prep.productCodeSnapshot ?? prep.productCode,
-    racks: prep.racks ?? 0,
-    pieces: prep.pieces ?? 0,
-    cases: prep.cases,
-    poNumber: prep.poNumber ?? '',
-    deliveryDate: prep.deliveryDate ?? '',
-    makeDate: prep.makeDate ?? '',
-    cookType: prep.cookType ?? '',
-    targetTemp: prep.targetTemp ?? 0,
-    expectedCookMinutes: prep.expectedCookMinutes ?? 0,
-    expectedChillMinutes: prep.expectedChillMinutes,
-    expectedPackMinutes: prep.expectedPackMinutes,
-    rackType: prep.rackType ?? '',
-    species: prep.species ?? '',
-    packagingType: prep.packagingType ?? '',
-    thermalOwner: prep.thermalOwner ?? '',
-    criticalLimit: prep.criticalLimit,
-    stage: 'rtc',
-    status: initStatus,
-    prepQueueId: prepId,
-    startTime: prep.startTime ?? now,
-    assignedSmokehouse: prep.assignedSmokehouse ?? null,
-    processOrder: prep.processOrder,
-    plannedDate: prep.plannedDate,
-    department: prep.department,
-    createdBy: prep.createdBy ?? by,
+export async function oItemCreateManualFromInput(
+  input: Record<string, unknown>,
+): Promise<{ prepId: string; oItemId: string }> {
+  assertStressScenarioReadOnly();
+  const identity = stableHash(JSON.stringify(input));
+  const result = await serverExecuteProductionAction({
+    action: 'rtc_create_manual', itemId: `manual_${identity}`, payload: input,
+    requestId: secureRequestId('rtc_manual', identity, input),
   });
+  if (!result.prepId || !result.oItemId) throw new Error('Manual RTC entry returned an incomplete canonical result.');
+  return { prepId: result.prepId, oItemId: result.oItemId };
 }
 
 // ── RTC transitions ───────────────────────────────────────────────────────────
@@ -284,7 +294,7 @@ export async function oItemAdvanceRTCStatus(
   toStatus: OItemStatus,
   by = 'system',
 ): Promise<void> {
-  await patchOItem(oItemId, currentStage, currentStatus, toStatus, by);
+  await submitProductionAction('rtc_advance', oItemId, { toStatus, requestedBy: by }, { stage: currentStage, status: currentStatus });
 }
 
 // ── Thermal transitions ───────────────────────────────────────────────────────
@@ -297,10 +307,7 @@ export async function oItemAssignSmokehouse(
   smokehouseId: string,
   by = 'system',
 ): Promise<void> {
-  await assignSmokehouseToPrep(prepId, smokehouseId);
-  await patchOItem(oItemId, currentStage, currentStatus, 'assigned', by, {
-    assignedSmokehouse: smokehouseId,
-  });
+  await submitProductionAction('assign_oven', oItemId, { equipmentId: smokehouseId, prepId, requestedBy: by }, { stage: currentStage, status: currentStatus });
 }
 
 export async function oItemVerifyLoad(
@@ -308,14 +315,7 @@ export async function oItemVerifyLoad(
   prepId: string,
   verifiedBy: string,
 ): Promise<void> {
-  // Pass oItemId so verifyLoadForPrep accepts currentLoadId matching either the
-  // prep doc ID OR the canonical OItem doc ID (dual-identity for child loads).
-  await verifyLoadForPrep(prepId, verifiedBy, oItemId);
-  await patchOItemFields(oItemId, {
-    loadedVerified: true,
-    loadedVerifiedBy: verifiedBy,
-    loadedVerifiedAt: Timestamp.now(),
-  });
+  await submitProductionAction('verify_load', oItemId, { prepId, verifiedBy });
 }
 
 /**
@@ -330,10 +330,7 @@ export async function oItemAssignSmokehouseOnly(
   smokehouseName: string,
   by = 'system',
 ): Promise<void> {
-  await updatePrepQueueAssignment(prepId, smokehouseName);
-  await patchOItem(oItemId, currentStage, currentStatus, 'assigned', by, {
-    assignedSmokehouse: smokehouseName,
-  });
+  await submitProductionAction('assign_oven', oItemId, { equipmentId: smokehouseName, prepId, requestedBy: by }, { stage: currentStage, status: currentStatus });
 }
 
 /**
@@ -349,16 +346,10 @@ export async function oItemAssignAndStartCook(
   extras?: { startingTemp?: number; startingProductTemp?: number },
   by = 'system',
 ): Promise<void> {
-  await ensureSmokehouseDoc(smokehouseName);
-  // Pass oItemId so the occupancy check accepts currentLoadId matching either
-  // the prep ID or the OItem ID (handles edge cases from split-rack allocation).
-  await startCookFromPrep(prepId, smokehouseName, extras, oItemId);
-  await patchOItem(oItemId, currentStage, currentStatus, 'cooking', by, {
-    assignedSmokehouse: smokehouseName,
-    cookStartedAt: Timestamp.now(),
-    startingTemp: extras?.startingTemp,
-    startingProductTemp: extras?.startingProductTemp,
-  });
+  if (currentStatus !== 'assigned') {
+    await submitProductionAction('assign_oven', oItemId, { equipmentId: smokehouseName, prepId, requestedBy: by }, { stage: currentStage, status: currentStatus });
+  }
+  await submitProductionAction('start_cook', oItemId, { equipmentId: smokehouseName, ...extras });
 }
 
 /**
@@ -393,8 +384,9 @@ export async function oItemAutoSplitThermalLoad(
   const splitCount = chunks.length;
 
   let prepTemplate: PrepQueueDoc | null = null;
-  if (parent.prepQueueId) {
-    const prepSnap = await getDoc(docRef('prep_queue', parent.prepQueueId));
+  const parentPrepId = parent.prepQueueId;
+  if (parentPrepId) {
+    const prepSnap = await getDoc(docRef('prep_queue', parentPrepId));
     if (prepSnap.exists()) prepTemplate = prepSnap.data() as PrepQueueDoc;
   }
 
@@ -507,6 +499,15 @@ export async function oItemAllocateSmokehouseLoad(
   remainingRackCount: number;
   capacity: number;
 }> {
+  const result = await submitProductionAction('allocate_oven_load', parentOItemId, { equipmentId: smokehouseName, setupType, requestedBy: by });
+  if (!result.childId || result.assignedRackCount == null || result.remainingRackCount == null || result.capacity == null) {
+    throw new Error('Smokehouse allocation returned an incomplete canonical result.');
+  }
+  return { parentId: parentOItemId, childId: result.childId, assignedRackCount: result.assignedRackCount, remainingRackCount: result.remainingRackCount, capacity: result.capacity };
+
+  /* istanbul ignore next -- retained only as schema documentation until the
+     staged migration proves no old clients depend on this legacy algorithm. */
+  // eslint-disable-next-line no-unreachable
   const parentSnap = await getDoc(oiRef(parentOItemId));
   if (!parentSnap.exists()) throw new Error('Operational item not found.');
   const parent = { id: parentSnap.id, ...parentSnap.data() } as OItemItem;
@@ -582,14 +583,15 @@ export async function oItemAllocateSmokehouseLoad(
   const splitCount = Math.ceil(originalRackCount / capacity);
 
   let prepTemplate: PrepQueueDoc | null = null;
-  if (parent.prepQueueId) {
-    const prepSnap = await getDoc(docRef('prep_queue', parent.prepQueueId));
+  const allocatedParentPrepId = parent.prepQueueId;
+  if (allocatedParentPrepId) {
+    const prepSnap = await getDoc(docRef('prep_queue', allocatedParentPrepId!));
     if (prepSnap.exists()) prepTemplate = prepSnap.data() as PrepQueueDoc;
   }
 
   let childPrepId: string | null = null;
   if (prepTemplate) {
-    const childPrep: PrepQueueDoc = {
+    const childPrep = {
       ...prepTemplate,
       racks: assignedRackCount,
       status: 'assigned',
@@ -597,7 +599,7 @@ export async function oItemAllocateSmokehouseLoad(
       assignedSmokehouse: smokehouseName,
       targetSmokehouseId: smokehouseName,
       startTime: Timestamp.now(),
-    };
+    } as PrepQueueDoc;
     childPrepId = await createPrepQueueItem(childPrep);
   }
 
@@ -699,13 +701,7 @@ export async function oItemStartCook(
   extras?: { startingTemp?: number; startingProductTemp?: number },
   by = 'system',
 ): Promise<void> {
-  // Pass oItemId for dual-identity occupancy check inside startCookForPrep.
-  await startCookForPrep(prepId, extras, oItemId);
-  await patchOItem(oItemId, currentStage, currentStatus, 'cooking', by, {
-    cookStartedAt: Timestamp.now(),
-    startingTemp: extras?.startingTemp,
-    startingProductTemp: extras?.startingProductTemp,
-  });
+  await submitProductionAction('start_cook', oItemId, { prepId, requestedBy: by, ...extras }, { stage: currentStage, status: currentStatus });
 }
 
 export async function oItemRecord50Cut(
@@ -713,17 +709,7 @@ export async function oItemRecord50Cut(
   prepId: string,
   extras?: { observedTemp?: number; deviation?: ThermalDeviationInput },
 ): Promise<void> {
-  await record50CutForPrep(prepId, extras);
-  const update: Partial<OItemDoc> = { cut50At: Timestamp.now() };
-  if (extras?.observedTemp !== undefined) update.cut50ObservedTemp = extras.observedTemp;
-  if (extras?.deviation) {
-    update.hasDeviation = true;
-    update.deviationType = extras.deviation.type;
-    update.deviationNotes = extras.deviation.notes;
-    update.deviationBy = extras.deviation.supervisorName;
-    update.deviationAt = Timestamp.now();
-  }
-  await patchOItemFields(oItemId, update);
+  await submitProductionAction('record_thermal_check', oItemId, { kind: 'cut_50', prepId, ...extras });
 }
 
 export async function oItemRecord130Cut(
@@ -731,17 +717,7 @@ export async function oItemRecord130Cut(
   prepId: string,
   extras?: { observedTemp?: number; deviation?: ThermalDeviationInput },
 ): Promise<void> {
-  await record130CutForPrep(prepId, extras);
-  const update: Partial<OItemDoc> = { cut130At: Timestamp.now() };
-  if (extras?.observedTemp !== undefined) update.cut130ObservedTemp = extras.observedTemp;
-  if (extras?.deviation) {
-    update.hasDeviation = true;
-    update.deviationType = extras.deviation.type;
-    update.deviationNotes = extras.deviation.notes;
-    update.deviationBy = extras.deviation.supervisorName;
-    update.deviationAt = Timestamp.now();
-  }
-  await patchOItemFields(oItemId, update);
+  await submitProductionAction('record_thermal_check', oItemId, { kind: 'cut_130', prepId, ...extras });
 }
 
 export async function oItemRecordSmokeApplied(
@@ -749,12 +725,7 @@ export async function oItemRecordSmokeApplied(
   prepId: string,
   appliedBy: string,
 ): Promise<void> {
-  await recordSmokeAppliedForPrep(prepId, appliedBy);
-  await patchOItemFields(oItemId, {
-    smokeApplied: true,
-    smokeAppliedAt: Timestamp.now(),
-    smokeAppliedBy: appliedBy,
-  });
+  await submitProductionAction('record_thermal_check', oItemId, { kind: 'smoke_applied', prepId, appliedBy });
 }
 
 export async function oItemRecordCriticalTemp(
@@ -764,21 +735,7 @@ export async function oItemRecordCriticalTemp(
   verifiedBy: string,
   extras?: { probeTemps?: number[]; deviation?: ThermalDeviationInput },
 ): Promise<void> {
-  await recordCriticalTempForPrep(prepId, criticalTempValue, verifiedBy, extras);
-  const update: Partial<OItemDoc> = {
-    criticalTempReachedAt: Timestamp.now(),
-    criticalTempValue,
-    criticalTempVerifiedBy: verifiedBy,
-  };
-  if (extras?.probeTemps !== undefined) update.probeTemps = extras.probeTemps;
-  if (extras?.deviation) {
-    update.hasDeviation = true;
-    update.deviationType = extras.deviation.type;
-    update.deviationNotes = extras.deviation.notes;
-    update.deviationBy = extras.deviation.supervisorName;
-    update.deviationAt = Timestamp.now();
-  }
-  await patchOItemFields(oItemId, update);
+  await submitProductionAction('record_thermal_check', oItemId, { kind: 'critical_temp', prepId, value: criticalTempValue, verifiedBy, ...extras });
 }
 
 export async function oItemRecordDuration(
@@ -786,11 +743,7 @@ export async function oItemRecordDuration(
   prepId: string,
   required: boolean,
 ): Promise<void> {
-  await recordDurationForPrep(prepId, required);
-  await patchOItemFields(oItemId, {
-    durationRequired: required,
-    durationRequiredAt: Timestamp.now(),
-  });
+  await submitProductionAction('record_thermal_check', oItemId, { kind: 'duration', prepId, required });
 }
 
 export async function oItemRecordEvacuation(
@@ -798,11 +751,7 @@ export async function oItemRecordEvacuation(
   prepId: string,
   method: 'dry_vac' | 'cold_shower',
 ): Promise<void> {
-  await recordEvacuationForPrep(prepId, method);
-  await patchOItemFields(oItemId, {
-    evacuationMethod: method,
-    evacuationCompletedAt: Timestamp.now(),
-  });
+  await submitProductionAction('finish_thermal', oItemId, { prepId, method });
 }
 
 /**
@@ -821,23 +770,7 @@ export async function oItemEvacuateToChill(
   extras?: { assignedBlastChiller?: string },
   by = 'system',
 ): Promise<void> {
-  await evacuateAndFinishCookForPrep(prepId, method, extras);
-
-  // Find the newly-created chill_log doc for this prepId.
-  const chillSnap = await getDocs(
-    query(collectionRef('chill_logs'), where('prepId', '==', prepId)),
-  );
-  const chillDoc = chillSnap.docs.find((d) => d.data().status === 'waiting');
-  const chillLogId = chillDoc?.id ?? null;
-
-  await patchOItem(oItemId, currentStage, currentStatus, 'awaiting_chill', by, {
-    evacuationMethod: method,
-    evacuationCompletedAt: Timestamp.now(),
-    chillLogId,
-    chillLogStatus: 'waiting',
-    chillCreatedAt: chillDoc?.data().createdAt ?? Timestamp.now(),
-    ...(extras?.assignedBlastChiller ? { assignedBlastChiller: extras.assignedBlastChiller } : {}),
-  });
+  await submitProductionAction('finish_thermal', oItemId, { prepId, method, requestedBy: by, ...extras }, { stage: currentStage, status: currentStatus });
 }
 
 // ── Chill transitions ─────────────────────────────────────────────────────────
@@ -850,11 +783,7 @@ export async function oItemAssignChiller(
   chillerId: string,
   by = 'system',
 ): Promise<void> {
-  await assignChillLogToChiller(chillLogId, chillerId);
-  await patchOItem(oItemId, currentStage, currentStatus, 'in_chill', by, {
-    chillerId,
-    chillLogStatus: 'running',
-  });
+  await submitProductionAction('assign_chiller', oItemId, { chillLogId, equipmentId: chillerId, requestedBy: by }, { stage: currentStage, status: currentStatus });
 }
 
 export async function oItemRecordChillCheck(
@@ -862,11 +791,7 @@ export async function oItemRecordChillCheck(
   chillLogId: string,
   input: { timeTo50F?: number; timeTo40F?: number },
 ): Promise<void> {
-  await recordChillCheck(chillLogId, input);
-  const update: Partial<OItemDoc> = {};
-  if (input.timeTo50F !== undefined) update.timeTo50F = input.timeTo50F;
-  if (input.timeTo40F !== undefined) update.timeTo40F = input.timeTo40F;
-  await patchOItemFields(oItemId, update);
+  await submitProductionAction('record_chill_check', oItemId, { chillLogId, ...input });
 }
 
 export async function oItemFlagChillDeviation(
@@ -914,34 +839,7 @@ export async function oItemFinishChill(
   },
   by = 'system',
 ): Promise<void> {
-  await finishChillLog(chillLogId, extras);
-
-  // Find the newly-created qa_check doc.
-  const prepId = (await getDoc(docRef('chill_logs', chillLogId))).data()?.prepId;
-  let qaCheckId: string | null = null;
-  if (prepId) {
-    const qaSnap = await getDocs(
-      query(
-        collectionRef('qa_checks'),
-        where('prepId', '==', prepId),
-        where('status', '==', 'ready_for_qa'),
-      ),
-    );
-    qaCheckId = qaSnap.docs[0]?.id ?? null;
-  }
-
-  await patchOItem(oItemId, currentStage, currentStatus, 'ready_for_qa', by, {
-    chillLogStatus: 'complete',
-    qaCheckId,
-    qaCheckStatus: 'ready_for_qa',
-    qaTimestamp: Timestamp.now(),
-    signedOutTemp: extras?.signedOutTemp,
-    signedOutAt: extras?.signedOutTemp !== undefined ? Timestamp.now() : undefined,
-    coolerId: extras?.coolerId,
-    movedToCooler: extras?.coolerId !== undefined,
-    timeTo50F: extras?.timeTo50F,
-    timeTo40F: extras?.timeTo40F,
-  });
+  await submitProductionAction('complete_chill', oItemId, { chillLogId, requestedBy: by, ...extras }, { stage: currentStage, status: currentStatus });
 }
 
 // ── QA transitions ────────────────────────────────────────────────────────────
@@ -958,29 +856,7 @@ export async function oItemQAReview(
   },
   by = 'system',
 ): Promise<void> {
-  await updateQACheckReview(qaCheckId, input);
-
-  const toStatus: OItemStatus =
-    input.decision === 'approve_for_packaging'
-      ? 'ready_for_packaging'
-      : input.decision === 'qa_hold'
-        ? 'qa_hold'
-        : 'qa_review_required';
-
-  const qaCheckStatus =
-    input.decision === 'approve_for_packaging'
-      ? 'ready_for_packaging'
-      : input.decision === 'qa_hold'
-        ? 'qa_hold'
-        : 'qa_review_required';
-
-  await patchOItem(oItemId, currentStage, currentStatus, toStatus, by, {
-    qaCheckStatus,
-    qaDecision: input.decision,
-    qaReviewedBy: input.reviewedBy,
-    qaReviewedAt: Timestamp.now(),
-    qaNotes: input.notes,
-  });
+  await submitProductionAction('qa_review', oItemId, { qaCheckId, requestedBy: by, ...input }, { stage: currentStage, status: currentStatus });
 }
 
 export async function oItemQAResubmit(
@@ -991,12 +867,7 @@ export async function oItemQAResubmit(
   resubmissionNote: string,
   by = 'system',
 ): Promise<void> {
-  await resubmitQACheckForReview(qaCheckId, resubmissionNote);
-  await patchOItem(oItemId, currentStage, currentStatus, 'ready_for_qa', by, {
-    qaCheckStatus: 'ready_for_qa',
-    qaReviewedBy: null,
-    qaReviewedAt: null,
-  });
+  await submitProductionAction('qa_resubmit', oItemId, { qaCheckId, note: resubmissionNote, requestedBy: by }, { stage: currentStage, status: currentStatus });
 }
 
 export async function oItemAppendQANote(
@@ -1022,12 +893,10 @@ export async function oItemStartPackaging(
   qaCheckId: string,
   by = 'system',
 ): Promise<string> {
-  const packagingLogId = await startPackagingForQACheck(qaCheckId);
-  await patchOItem(oItemId, currentStage, currentStatus, 'packaging_in_progress', by, {
-    packagingLogId,
-    packagingLogStatus: 'running',
-    packagingStartedAt: Timestamp.now(),
-  });
+  const result = await submitProductionAction('start_packaging', oItemId, { qaCheckId, requestedBy: by }, { stage: currentStage, status: currentStatus });
+  const refreshed = await getDoc(oiRef(result.item.id));
+  const packagingLogId = refreshed.data()?.packagingLogId;
+  if (!packagingLogId) throw new Error('Packaging handoff returned no log identity.');
   return packagingLogId;
 }
 
@@ -1046,17 +915,7 @@ export async function oItemCompletePackaging(
   },
   by = 'system',
 ): Promise<void> {
-  await completePackagingLog(packagingLogId, input);
-  await patchOItem(oItemId, currentStage, currentStatus, 'packaging_complete', by, {
-    packagingLogStatus: 'complete',
-    casesProduced: input.casesProduced,
-    unitsProduced: input.unitsProduced,
-    yieldPercent: input.yieldPercent,
-    packagingLine: input.packagingLine,
-    packagedBy: input.packagedBy,
-    packagingNotes: input.notes,
-    packagingCompletedAt: Timestamp.now(),
-  });
+  await submitProductionAction('complete_packaging', oItemId, { packagingLogId, requestedBy: by, ...input }, { stage: currentStage, status: currentStatus });
 }
 
 export async function oItemHoldPackaging(

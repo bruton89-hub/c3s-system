@@ -16,6 +16,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from
 import { Stack, router } from 'expo-router';
 
 import { C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import { C3SOperatorFocus } from '@/components/operator-ui';
 import { C3S_COLORS, C3S_RADIUS } from '@/constants/c3s-ui';
 
 import { getWeeklyPlanItems, type WeeklyPlanItem } from '@/lib/firebase/repository';
@@ -30,18 +31,13 @@ import {
   type UtilizationSlot,
 } from '@/lib/capacity';
 import { toSafeDate } from '@/lib/utils/dates';
+import { getOperationalItems, type OItemItem } from '@/lib/operational-items';
+import { getItemPresentation, itemBatch, itemName } from '@/lib/production/presentation';
 
 const HOUR_WIDTH = 36;       // px per hour
 const ROW_HEIGHT = 28;
 const LABEL_WIDTH = 90;
 const DAY_HOURS = 24;
-
-function toISODate(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
 
 function startOfDay(d: Date): Date {
   const r = new Date(d);
@@ -59,6 +55,7 @@ export default function ThermalTimelineScreen() {
   const [anchorDay, setAnchorDay] = useState<Date>(() => startOfDay(new Date()));
   const [items, setItems] = useState<WeeklyPlanItem[]>([]);
   const [profiles, setProfiles] = useState<ProductProfile[]>([]);
+  const [operationalItems, setOperationalItems] = useState<OItemItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -77,12 +74,14 @@ export default function ThermalTimelineScreen() {
     setLoading(true);
     setError(null);
     try {
-      const [p, i] = await Promise.all([
+      const [p, i, operational] = await Promise.all([
         getActiveProductProfiles(),
         getWeeklyPlanItems(),
+        getOperationalItems(),
       ]);
       setProfiles(p);
       setItems(i);
+      setOperationalItems(operational);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load timeline');
     } finally {
@@ -162,6 +161,13 @@ export default function ThermalTimelineScreen() {
     setAnchorDay((d) => new Date(d.getTime() + delta * 24 * 3600 * 1000));
   }
 
+  const timelineLoadCount = Object.values(smokeByHouse).reduce((sum, group) => sum + group.length, 0);
+  const activeCooks = useMemo(() => operationalItems.filter((item) => item.stage === 'thermal' && ['assigned', 'cooking'].includes(item.status)).sort((a, b) => {
+    const aa = a.expectedCookComplete ? new Date(a.expectedCookComplete).getTime() : Number.MAX_SAFE_INTEGER;
+    const bb = b.expectedCookComplete ? new Date(b.expectedCookComplete).getTime() : Number.MAX_SAFE_INTEGER;
+    return aa - bb;
+  }), [operationalItems]);
+
   return (
     <C3SScreen>
       <Stack.Screen options={{ headerShown: false }} />
@@ -186,6 +192,14 @@ export default function ThermalTimelineScreen() {
             </View>
           }
         />
+        <C3SOperatorFocus
+          status={`${timelineLoadCount} scheduled loads`}
+          action={warnings.length > 0 ? 'Review Capacity Risk' : 'Review Thermal Schedule'}
+          detail="Use the timeline to identify equipment overlap; production actions remain in Thermal and Chill."
+          tone={warnings.length > 0 ? 'critical' : timelineLoadCount > 0 ? 'active' : 'complete'}
+        />
+
+        <View style={styles.events}><Text style={styles.eventsTitle}>Active Cooks & Upcoming Actions</Text>{activeCooks.slice(0, 8).map((item) => { const info = getItemPresentation(item); return <Pressable key={item.id} style={styles.eventRow} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><View style={{ flex: 1 }}><Text style={styles.eventTitle}>{item.assignedSmokehouse || 'Unassigned oven'} • Batch {itemBatch(item)}</Text><Text style={styles.eventText}>{itemName(item)} • {info.nextAction}{item.expectedCookComplete ? ` • expected ${new Date(item.expectedCookComplete).toLocaleTimeString()}` : ''}</Text></View><Text style={styles.eventArrow}>›</Text></Pressable>; })}{!activeCooks.length ? <Text style={styles.eventText}>No active cooks or pending cook starts.</Text> : null}</View>
 
         {warnings.length > 0 && (
           <View style={styles.warnings}>
@@ -315,24 +329,30 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10, paddingVertical: 8,
     minHeight: 36, justifyContent: 'center',
   },
-  navBtnAccent: { backgroundColor: '#1565C0', borderColor: '#1565C0' },
+  navBtnAccent: { backgroundColor: C3S_COLORS.accent, borderColor: C3S_COLORS.accent },
   navBtnText: { color: C3S_COLORS.textStrong, fontSize: 12, fontWeight: '700' },
 
   warnings: {
-    borderWidth: 1, borderColor: '#7A2E2E',
-    backgroundColor: '#1f1212',
+    borderWidth: 1, borderColor: C3S_COLORS.danger,
+    backgroundColor: C3S_COLORS.dangerSoft,
     borderRadius: C3S_RADIUS.card,
     paddingHorizontal: 10, paddingVertical: 8,
     marginBottom: 8,
   },
-  warningsTitle: { color: '#FFB4B4', fontSize: 12, fontWeight: '800', marginBottom: 4 },
+  warningsTitle: { color: C3S_COLORS.danger, fontSize: 12, fontWeight: '800', marginBottom: 4 },
   warningChip: {
     paddingHorizontal: 8, paddingVertical: 4,
     borderRadius: 999,
-    backgroundColor: '#2a1414',
-    borderWidth: 1, borderColor: '#7A2E2E',
+    backgroundColor: C3S_COLORS.dangerSoft,
+    borderWidth: 1, borderColor: C3S_COLORS.danger,
   },
-  warningChipText: { color: '#FFB4B4', fontSize: 11, fontWeight: '600' },
+  warningChipText: { color: C3S_COLORS.danger, fontSize: 11, fontWeight: '600' },
+  events: { borderWidth: 1, borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panel, borderRadius: C3S_RADIUS.card, padding: 12, gap: 5, marginBottom: 8 },
+  eventsTitle: { color: C3S_COLORS.textStrong, fontSize: 16, fontWeight: '900', marginBottom: 3 },
+  eventRow: { minHeight: 52, flexDirection: 'row', alignItems: 'center', borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: C3S_COLORS.border, paddingVertical: 7 },
+  eventTitle: { color: C3S_COLORS.textPrimary, fontSize: 13, fontWeight: '900' },
+  eventText: { color: C3S_COLORS.textMuted, fontSize: 12, lineHeight: 17, fontWeight: '600', marginTop: 2 },
+  eventArrow: { color: C3S_COLORS.accent, fontSize: 25, marginLeft: 8 },
 
   error: { color: C3S_COLORS.danger, fontSize: 12, marginBottom: 6 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
@@ -368,8 +388,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
     justifyContent: 'center',
   },
-  barOk: { backgroundColor: '#FB8C00' },      // smokehouse OK (orange)
-  barChill: { backgroundColor: '#4FC3F7' },   // chiller OK (blue)
+  barOk: { backgroundColor: C3S_COLORS.warning },      // smokehouse OK (orange)
+  barChill: { backgroundColor: C3S_COLORS.info },   // chiller OK (blue)
   barOver: { backgroundColor: C3S_COLORS.danger, borderWidth: 1, borderColor: '#fff' },
   barText: { color: '#0D1117', fontSize: 9, fontWeight: '800' },
 });

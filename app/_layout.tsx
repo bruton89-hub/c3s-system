@@ -1,11 +1,10 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
+import { DefaultTheme, ThemeProvider } from '@react-navigation/native';
 import { router, Stack, useSegments } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
 import { ActivityIndicator, Text, View } from 'react-native';
 import 'react-native-reanimated';
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
 import { C3SProvider } from '@/store/c3s-store';
 import { AuthProvider, useAuth } from '@/lib/auth/context';
 import { C3S_COLORS } from '@/constants/c3s-ui';
@@ -39,7 +38,6 @@ function useAuthRedirect() {
 
 function RootLayoutNav() {
   const { status, startupError } = useAuth();
-  const colorScheme = useColorScheme();
   useAuthRedirect();
 
   // Show a full-screen spinner while Firebase resolves the initial auth state
@@ -73,7 +71,7 @@ function RootLayoutNav() {
         <View style={{ maxWidth: 520, borderWidth: 1, borderColor: C3S_COLORS.danger, padding: 16, borderRadius: 8 }}>
           <ActivityIndicator color={C3S_COLORS.danger} size="small" />
           <Text style={{ color: C3S_COLORS.textStrong, marginTop: 12, fontWeight: '700' }}>
-            C3S startup error: Firebase configuration missing.
+            C3S could not start safely.
           </Text>
           <Text style={{ color: C3S_COLORS.textMuted, marginTop: 8 }}>
             {startupError ?? 'Missing EXPO_PUBLIC_FIREBASE_* environment values.'}
@@ -84,7 +82,7 @@ function RootLayoutNav() {
   }
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+    <ThemeProvider value={DefaultTheme}>
       <Stack>
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="sign-in" options={{ headerShown: false }} />
@@ -92,9 +90,16 @@ function RootLayoutNav() {
         <Stack.Screen name="qa-review" options={{ headerShown: false }} />
         <Stack.Screen name="thermal-timeline" options={{ headerShown: false }} />
         <Stack.Screen name="products/index" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
+        <Stack.Screen name="production-item" options={{ headerShown: false }} />
+        <Stack.Screen name="hold" options={{ headerShown: false }} />
+        <Stack.Screen name="more" options={{ headerShown: false }} />
+        <Stack.Screen name="simulation-alerts" options={{ headerShown: false }} />
+        <Stack.Screen name="holds" options={{ headerShown: false }} />
+        <Stack.Screen name="equipment" options={{ headerShown: false }} />
+        <Stack.Screen name="shift-handoff" options={{ headerShown: false }} />
+        <Stack.Screen name="modal" options={{ presentation: 'modal', headerShown: false }} />
       </Stack>
-      <StatusBar style="auto" />
+      <StatusBar style="dark" />
     </ThemeProvider>
   );
 }

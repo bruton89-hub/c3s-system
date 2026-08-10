@@ -1,402 +1,171 @@
 import { useCallback, useMemo, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
-import { router } from 'expo-router';
+import { type Href, router } from 'expo-router';
 
-import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
-import {
-  getChillLogs,
-  getPackagingLogs,
-  getPrepQueueItems,
-  getQAChecks,
-  resetOperationalData,
-  getWeeklyPlanItems,
-  type ChillLogItem,
-  type PackagingLogItem,
-  type PrepQueueItem,
-  type QACheckItem,
-  type WeeklyPlanItem,
-} from '@/lib/firebase/repository';
-import { getRecentEvents, type OperationalEvent } from '@/lib/operational-events';
-import { logFirebaseError, toOperatorMessage } from '@/lib/auth/diagnostics';
+import { C3SBrandHeader } from '@/components/c3s-brand';
+import { ProductionItemCard } from '@/components/production-item-card';
+import { C3SPage, C3SScreen } from '@/components/c3s-ui';
+import { C3S_COLORS } from '@/constants/c3s-ui';
 import { getOperationalItems, type OItemItem } from '@/lib/operational-items';
+import { getProductionAlert, sortProductionItems, type ProductionAlert } from '@/lib/production/presentation';
+import { logFirebaseError, toOperatorMessage } from '@/lib/auth/diagnostics';
+import { atRiskItems, equipmentCounts, recentlyCompleted, shiftFlowCounts, shiftSummary, type EquipmentSummary } from '@/lib/operations/summary';
+import { getEquipmentOverview } from '@/lib/operations/equipment';
+import { StressScenarioBanner } from '@/components/stress-scenario-banner';
+import { DataFreshness } from '@/components/data-freshness';
 
-type NavRoute = '/planning' | '/prep-queue' | '/thermal' | '/chill' | '/qa-review' | '/packaging';
-
-function ageHours(ms: number) {
-  return (Date.now() - ms) / (1000 * 60 * 60);
-}
-
-function fmtTs(ms?: number) {
-  if (!ms || !Number.isFinite(ms)) return '—';
-  return new Date(ms).toLocaleString();
-}
-
-export default function PlantFlowScreen() {
-  const [plans, setPlans] = useState<WeeklyPlanItem[]>([]);
-  const [preps, setPreps] = useState<PrepQueueItem[]>([]);
-  const [chillLogs, setChillLogs] = useState<ChillLogItem[]>([]);
-  const [qaChecks, setQaChecks] = useState<QACheckItem[]>([]);
-  const [packagingLogs, setPackagingLogs] = useState<PackagingLogItem[]>([]);
-  const [events, setEvents] = useState<OperationalEvent[]>([]);
-  const [oItems, setOItems] = useState<OItemItem[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [resetMessage, setResetMessage] = useState<string | null>(null);
-  const [confirmReset, setConfirmReset] = useState(false);
-  const [isResetting, setIsResetting] = useState(false);
+export default function HomeScreen() {
+  const [items, setItems] = useState<OItemItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [equipment, setEquipment] = useState<EquipmentSummary[]>([]);
+  const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
 
   const load = useCallback(async () => {
-    setIsLoading(true);
-    setLoadError(null);
-    const results = await Promise.allSettled([
-      getOperationalItems(),
-      getWeeklyPlanItems(),
-      getPrepQueueItems(),
-      getChillLogs(),
-      getQAChecks(),
-      getPackagingLogs(),
-      getRecentEvents(10),
-    ]);
-    const [oR, pR, prR, chR, qaR, pkR, evR] = results;
-    if (oR.status === 'fulfilled') setOItems(oR.value);
-    if (pR.status === 'fulfilled') setPlans(pR.value);
-    if (prR.status === 'fulfilled') setPreps(prR.value);
-    if (chR.status === 'fulfilled') setChillLogs(chR.value);
-    if (qaR.status === 'fulfilled') setQaChecks(qaR.value);
-    if (pkR.status === 'fulfilled') setPackagingLogs(pkR.value);
-    if (evR.status === 'fulfilled') setEvents(evR.value);
-    // Surface the first failure as an error banner
-    const firstFail = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
-    if (firstFail) {
-      logFirebaseError('PlantFlow', 'operational_items/weekly_plan/prep_queue/chill_logs/qa_checks/packaging_logs', firstFail.reason);
-      setLoadError(toOperatorMessage(firstFail.reason, 'Failed to load plant flow data.'));
+    setLoading(true);
+    setError(null);
+    try {
+      const nextItems = await getOperationalItems();
+      setItems(nextItems);
+      setRefreshedAt(Date.now());
+      try { setEquipment(await getEquipmentOverview(nextItems)); } catch { setEquipment([]); }
+    } catch (err) {
+      logFirebaseError('Home', 'operational_items', err);
+      setError(toOperatorMessage(err, 'Production status could not be loaded.'));
+    } finally {
+      setLoading(false);
     }
-    setIsLoading(false);
   }, []);
 
-  useFocusEffect(useCallback(() => { load(); }, [load]));
+  useFocusEffect(useCallback(() => { void load(); }, [load]));
 
-  const summary = useMemo(() => {
-    const planning = {
-      planned: plans.filter((x) => x.status === 'planned').length,
-      rtc: plans.filter((x) => x.status === 'RTC').length,
-      thermal: plans.filter((x) => x.status === 'Ready for Thermal').length,
-      cooking: plans.filter((x) => x.status === 'Cooking').length,
-      chill: plans.filter((x) => x.status === 'Awaiting Chill' || x.status === 'Chill Running').length,
-      qa: plans.filter((x) => x.status === 'Ready for QA').length,
-      packaging: plans.filter((x) => x.status === 'Ready for Packaging').length,
-      complete: plans.filter((x) => x.status === 'Complete').length,
-      hold: plans.filter((x) => x.status === 'Hold').length,
-    };
-
-    const rtc = {
-      sent: oItems.filter((x) => x.stage === 'rtc' && (x.status === 'staged' || x.status === 'staging')).length,
-      prep: oItems.filter((x) => x.stage === 'rtc' && x.status === 'prepping').length,
-      ready: oItems.filter((x) => x.status === 'ready_for_thermal' || x.status === 'ready').length,
-      hold: oItems.filter((x) => x.stage === 'rtc' && x.status === 'hold').length,
-      moved: oItems.filter((x) => x.status === 'moved_downstream').length,
-    };
-
-    const thermal = {
-      readyToLoad: oItems.filter((x) => x.stage === 'thermal' && (x.status === 'ready_for_thermal' || x.status === 'ready')).length,
-      assigned: oItems.filter((x) => x.stage === 'thermal' && x.status === 'assigned').length,
-      cooking: oItems.filter((x) => x.stage === 'thermal' && (x.status === 'cooking' || x.status === 'in_thermal')).length,
-      hold: oItems.filter((x) => x.stage === 'thermal' && x.status === 'hold').length,
-    };
-
-    const chill = {
-      awaitingAssignment: oItems.filter((x) => x.stage === 'chill' && x.status === 'awaiting_chill').length,
-      running: oItems.filter((x) => x.stage === 'chill' && x.status === 'in_chill').length,
-      readyForQa: oItems.filter((x) => x.status === 'ready_for_qa').length,
-      hold: oItems.filter((x) => x.stage === 'chill' && (x.status === 'hold' || x.chillLogStatus === 'deviation')).length,
-    };
-
-    const qa = {
-      ready: oItems.filter((x) => x.stage === 'qa' && x.status === 'ready_for_qa').length,
-      hold: oItems.filter((x) => x.stage === 'qa' && (x.status === 'qa_hold' || x.status === 'qa_review_required')).length,
-      released: oItems.filter((x) => x.status === 'ready_for_packaging').length,
-      deviation: oItems.filter((x) => x.stage === 'qa' && x.hasDeviation).length,
-    };
-
-    const packaging = {
-      ready: oItems.filter((x) => x.stage === 'packaging' && x.status === 'ready_for_packaging').length,
-      inProgress: oItems.filter((x) => x.stage === 'packaging' && x.status === 'packaging_in_progress').length,
-      packaged: oItems.filter((x) => x.status === 'packaging_complete' || x.status === 'complete').length,
-      hold: oItems.filter((x) => x.stage === 'packaging' && (x.status === 'hold' || x.packagingLogStatus === 'deviation')).length,
-    };
-
-    return { planning, rtc, thermal, chill, qa, packaging };
-  }, [plans, preps, chillLogs, qaChecks, packagingLogs, oItems]);
-
-  const stuckItems = useMemo(() => {
-    const items: string[] = [];
-
-    oItems.forEach((p) => {
-      const startMs = p.startTime?.toMillis?.() ?? 0;
-      const cookStartMs = p.cookStartedAt?.toMillis?.() ?? startMs;
-      const hFromStart = ageHours(startMs);
-      const hFromCook = ageHours(cookStartMs);
-      const cookExpectedH = ((p.expectedCookMinutes ?? 0) / 60) + 1;
-
-      if ((p.status === 'staged' || p.status === 'staging') && hFromStart > 4) items.push(`${p.productNameSnapshot || p.productName}: RTC staged > 4h`);
-      if (p.status === 'prepping' && hFromStart > 4) items.push(`${p.productNameSnapshot || p.productName}: In Prep > 4h`);
-      if ((p.status === 'ready_for_thermal' || p.status === 'ready') && hFromStart > 2) items.push(`${p.productNameSnapshot || p.productName}: Ready for Thermal > 2h`);
-      if ((p.status === 'cooking' || p.status === 'in_thermal') && hFromCook > cookExpectedH) {
-        items.push(`${p.productNameSnapshot || p.productName}: Cooking beyond expected (${cookExpectedH.toFixed(1)}h)`);
-      }
-    });
-
-    oItems.forEach((log) => {
-      const created = log.chillCreatedAt?.toMillis?.() ?? log.updatedAt?.toMillis?.() ?? 0;
-      const h = ageHours(created);
-      const expectedH = ((log.expectedChillMinutes ?? 0) / 60) + 1;
-      if (log.status === 'in_chill' && h > expectedH) {
-        items.push(`${log.productName || log.id}: Chill Running beyond expected (${expectedH.toFixed(1)}h)`);
-      }
-    });
-
-    oItems.forEach((q) => {
-      const ts = q.updatedAt?.toMillis?.() ?? 0;
-      if (q.status === 'ready_for_qa' && ageHours(ts) > 2) items.push(`${q.productName || q.id}: Ready for QA > 2h`);
-      if (q.status === 'ready_for_packaging' && ageHours(ts) > 4) items.push(`${q.productName || q.id}: Ready for Packaging > 4h`);
-    });
-
-    return items.slice(0, 20);
-  }, [oItems]);
-
-  const missingActions = useMemo(() => {
-    const items: string[] = [];
-
-    oItems.forEach((p) => {
-      if ((p.status === 'ready_for_thermal' || p.status === 'ready') && !p.assignedSmokehouse) {
-        items.push(`${p.productNameSnapshot || p.productName}: Ready for Thermal with no smokehouse`);
-      }
-      if ((p.status === 'cooking' || p.status === 'in_thermal') && !p.criticalTempReachedAt) {
-        items.push(`${p.productNameSnapshot || p.productName}: Cooking with no probe-out/critical temp`);
-      }
-    });
-
-    oItems.forEach((log) => {
-      if (log.stage === 'chill' && log.status === 'awaiting_chill' && !log.chillerId) {
-        items.push(`${log.productName || log.id}: Cook complete with no chiller assigned`);
-      }
-      if (log.stage === 'chill' && log.status === 'in_chill' && (log.timeTo50F == null || log.timeTo40F == null)) {
-        items.push(`${log.productName || log.id}: Chill running with no next check due`);
-      }
-    });
-
-    oItems.forEach((q) => {
-      if (q.status === 'ready_for_qa' && !q.qaReviewedBy) {
-        items.push(`${q.productName || q.id}: Ready for QA with no reviewer`);
-      }
-      if (q.status === 'ready_for_packaging') {
-        const started = q.packagingLogStatus === 'running';
-        if (!started) items.push(`${q.productName || q.id}: Ready for Packaging with no packaging start`);
-      }
-    });
-
-    return items.slice(0, 20);
-  }, [oItems]);
+  const active = useMemo(() => sortProductionItems(items.filter((item) => !['complete', 'packaging_complete', 'split_parent'].includes(item.status))), [items]);
+  const alerts = useMemo(() => active.map((item) => getProductionAlert(item)).filter((alert): alert is ProductionAlert => Boolean(alert)), [active]);
+  const upNext = active.filter((item) => ['ready', 'ready_for_thermal', 'awaiting_chill', 'chill_complete', 'ready_for_qa', 'ready_for_packaging'].includes(item.status)).slice(0, 4);
+  const summary = useMemo(() => shiftSummary(items), [items]);
+  const flow = useMemo(() => shiftFlowCounts(active), [active]);
+  const risk = useMemo(() => atRiskItems(active, 4), [active]);
+  const completed = useMemo(() => recentlyCompleted(items, 3), [items]);
+  const equipmentSummary = useMemo(() => equipmentCounts(equipment), [equipment]);
 
   return (
     <C3SScreen>
       <C3SPage>
-        <C3SScreenHeader
-          title="Plant Flow"
-          subtitle="Supervisor command center: cross-department visibility"
-          right={<Pressable style={styles.refreshBtn} onPress={load}><Text style={styles.refreshText}>Refresh</Text></Pressable>}
-        />
+        <ScrollView
+          showsVerticalScrollIndicator={false}
+          refreshControl={<RefreshControl refreshing={loading} onRefresh={load} tintColor={C3S_COLORS.accent} />}
+          contentContainerStyle={styles.content}>
+          <C3SBrandHeader title="Home" subtitle="What needs to happen next" />
+          <StressScenarioBanner />
+          <DataFreshness refreshedAt={refreshedAt} failed={Boolean(error)} />
 
-        <ScrollView contentContainerStyle={styles.content}>
-          {__DEV__ ? (
-            <C3SCard borderColor="#C62828">
-              <Text style={styles.devTitle}>DEV ONLY — deletes operational test data</Text>
-              <Text style={styles.rowText}>
-                Clears: weekly_plan, prep_queue, chill_logs, qa_checks, packaging_logs, operational_events, alerts.
-              </Text>
-              <Text style={styles.rowText}>
-                Preserves: product_profiles, app config, product intelligence data. Equipment definitions are preserved.
-              </Text>
-              {confirmReset ? (
-                <View style={styles.devActions}>
-                  <Pressable
-                    style={styles.devDangerBtn}
-                    disabled={isResetting}
-                    onPress={async () => {
-                      try {
-                        setIsResetting(true);
-                        setResetMessage(null);
-                        await resetOperationalData({ clearEquipmentLoads: true });
-                        setResetMessage('Reset complete: operational data cleared and equipment loads reset.');
-                        setConfirmReset(false);
-                        await load();
-                      } catch (e) {
-                        setResetMessage(toOperatorMessage(e, 'Reset failed.'));
-                      } finally {
-                        setIsResetting(false);
-                      }
-                    }}>
-                    <Text style={styles.devDangerBtnText}>{isResetting ? 'Resetting...' : 'Confirm Reset Operational Data'}</Text>
-                  </Pressable>
-                  <Pressable style={styles.devCancelBtn} onPress={() => setConfirmReset(false)} disabled={isResetting}>
-                    <Text style={styles.devCancelBtnText}>Cancel</Text>
-                  </Pressable>
-                </View>
-              ) : (
-                <Pressable style={styles.devDangerBtn} onPress={() => setConfirmReset(true)}>
-                  <Text style={styles.devDangerBtnText}>Reset Operational Data</Text>
-                </Pressable>
-              )}
-              {resetMessage ? <Text style={styles.info}>{resetMessage}</Text> : null}
-            </C3SCard>
-          ) : null}
-          {isLoading ? <Text style={styles.info}>Loading plant flow...</Text> : null}
-          {loadError ? <Text style={styles.error}>{loadError}</Text> : null}
+          {error ? <Text style={styles.error}>{error}</Text> : null}
 
-          <Text style={styles.sectionTitle}>Department Flow Summary</Text>
-          <View style={styles.grid}>
-            <SummaryCard title="Planning" route="/planning" rows={[
-              `Planned: ${summary.planning.planned}`,
-              `Sent to RTC: ${summary.planning.rtc}`,
-              `Ready for Thermal: ${summary.planning.thermal}`,
-              `Cooking: ${summary.planning.cooking}`,
-              `Awaiting/Running Chill: ${summary.planning.chill}`,
-              `Ready for QA: ${summary.planning.qa}`,
-              `Ready for Packaging: ${summary.planning.packaging}`,
-              `Complete/Hold: ${summary.planning.complete}/${summary.planning.hold}`,
-            ]} onGo={() => router.push('/planning')} />
-            <SummaryCard title="RTC" route="/prep-queue" rows={[
-              `Sent from Planning: ${summary.rtc.sent}`,
-              `In Prep: ${summary.rtc.prep}`,
-              `Ready for Thermal: ${summary.rtc.ready}`,
-              `Moved Downstream: ${summary.rtc.moved}`,
-              `Hold: ${summary.rtc.hold}`,
-            ]} onGo={() => router.push('/prep-queue')} />
-            <SummaryCard title="Thermal" route="/thermal" rows={[
-              `Ready to Load: ${summary.thermal.readyToLoad}`,
-              `Assigned: ${summary.thermal.assigned}`,
-              `Cooking: ${summary.thermal.cooking}`,
-              `Hold: ${summary.thermal.hold}`,
-            ]} onGo={() => router.push('/thermal')} />
-            <SummaryCard title="Chill" route="/chill" rows={[
-              `Awaiting Chiller Assignment: ${summary.chill.awaitingAssignment}`,
-              `Chill Running: ${summary.chill.running}`,
-              `Ready for QA: ${summary.chill.readyForQa}`,
-              `Hold/Deviation: ${summary.chill.hold}`,
-            ]} onGo={() => router.push('/chill')} />
-            <SummaryCard title="QA" route="/qa-review" rows={[
-              `Ready for Review: ${summary.qa.ready}`,
-              `QA Hold: ${summary.qa.hold}`,
-              `Released to Packaging: ${summary.qa.released}`,
-              `Deviation Logged: ${summary.qa.deviation}`,
-            ]} onGo={() => router.push('/qa-review')} />
-            <SummaryCard title="Packaging" route="/packaging" rows={[
-              `Ready for Packaging: ${summary.packaging.ready}`,
-              `Packaging In Progress: ${summary.packaging.inProgress}`,
-              `Packaged: ${summary.packaging.packaged}`,
-              `Hold/Deviation: ${summary.packaging.hold}`,
-            ]} onGo={() => router.push('/packaging')} />
+          <Text style={styles.sectionTitle}>Shift Status</Text>
+          <View style={styles.summaryRow}>
+            <Summary value={summary.active} label="Active" tone="blue" />
+            <Summary value={summary.waiting} label="Waiting" tone="amber" />
+            <Summary value={summary.held} label="Held" tone="red" />
+            <Summary value={summary.critical} label="Critical" tone="red" />
+            <Summary value={equipmentSummary.inUse} label="Equipment In Use" tone="blue" />
+            <Summary value={equipmentSummary.available} label="Available" tone="blue" />
           </View>
 
-          <Text style={styles.sectionTitle}>Stuck Items</Text>
-          <ListCard empty="No stuck items currently.">
-            {stuckItems.map((x) => <Text key={x} style={styles.rowText}>• {x}</Text>)}
-          </ListCard>
+          <Text style={styles.sectionTitle}>Shift Progress</Text>
+          <View style={styles.progressCard}>{(['planning', 'rtc', 'thermal', 'chill', 'qa', 'packaging'] as const).map((stage) => <View key={stage} style={styles.progressItem}><Text style={styles.progressValue}>{flow[stage]}</Text><Text style={styles.progressLabel}>{stage === 'planning' ? 'Prep' : stage.toUpperCase()}</Text></View>)}</View>
 
-          <Text style={styles.sectionTitle}>Missing Required Actions</Text>
-          <ListCard empty="No missing required actions currently.">
-            {missingActions.map((x) => <Text key={x} style={styles.rowText}>• {x}</Text>)}
-          </ListCard>
+          <View style={styles.sectionHeading}><Text style={styles.sectionTitle}>At Risk</Text><Pressable hitSlop={8} onPress={() => router.push('/notifications')}><Text style={styles.link}>View alerts</Text></Pressable></View>
+          {risk.map((item) => <ProductionItemCard key={`risk-${item.id}`} item={item} compact />)}
+          {!loading && risk.length === 0 ? <Empty text="All active batches are on track." /> : null}
 
-          <Text style={styles.sectionTitle}>Latest Operational Events</Text>
-          <ListCard empty="No operational events available.">
-            {events.slice(0, 10).map((e) => (
-              <View key={e.id} style={styles.eventRow}>
-                <Text style={styles.eventTime}>{fmtTs(e.createdAt?.toMillis?.())}</Text>
-                <Text style={styles.eventMeta}>{`${e.type} | ${e.department} | ${e.severity}`}</Text>
-                <Text style={styles.rowText}>{e.notes || '—'}</Text>
-              </View>
-            ))}
-          </ListCard>
+          <View style={styles.sectionHeading}>
+            <Text style={styles.sectionTitle}>Needs Attention</Text>
+            <Pressable hitSlop={8} onPress={() => router.push('/notifications')}><Text style={styles.link}>View all</Text></Pressable>
+          </View>
+          {alerts.slice(0, 3).map((alert) => <AttentionCard key={alert.id} alert={alert} />)}
+          {!loading && alerts.length === 0 ? <Empty text="No production exceptions right now." /> : null}
+
+          <Text style={styles.sectionTitle}>Up Next</Text>
+          {upNext.map((item) => <ProductionItemCard key={item.id} item={item} compact />)}
+          {!loading && upNext.length === 0 ? <Empty text="No handoffs are waiting." /> : null}
+
+          <View style={styles.sectionHeading}>
+            <Text style={styles.sectionTitle}>Active Production</Text>
+            <Text style={styles.sectionCount}>{active.length}</Text>
+          </View>
+          {active.slice(0, 5).map((item) => <ProductionItemCard key={item.id} item={item} compact />)}
+          {!loading && active.length === 0 ? <Empty text="No active production items." /> : null}
+
+          <Text style={styles.sectionTitle}>Recently Completed</Text>
+          {completed.map((item) => <ProductionItemCard key={`completed-${item.id}`} item={item} compact />)}
+          {!loading && completed.length === 0 ? <Empty text="No recently completed batches." /> : null}
+
+          <Text style={styles.sectionTitle}>Quick Actions</Text>
+          <View style={styles.quickGrid}>
+            <QuickAction label="Create / Load Batch" route="/planning" />
+            <QuickAction label="View Holds" route="/holds" />
+            <QuickAction label="Critical Alerts" route="/notifications?filter=critical" />
+            <QuickAction label="Available Equipment" route="/equipment" />
+            <QuickAction label="Shift Handoff" route="/shift-handoff" />
+          </View>
+
+          <Pressable style={styles.primaryButton} onPress={() => router.push('/production' as Href)}>
+            <Text style={styles.primaryButtonText}>View Production</Text>
+          </Pressable>
         </ScrollView>
       </C3SPage>
     </C3SScreen>
   );
 }
 
-function SummaryCard({ title, rows, onGo }: { title: string; route: NavRoute; rows: string[]; onGo: () => void }) {
+function Summary({ value, label, tone }: { value: number; label: string; tone: 'blue' | 'amber' | 'red' }) {
+  const color = tone === 'red' ? C3S_COLORS.danger : tone === 'amber' ? C3S_COLORS.warning : C3S_COLORS.accent;
+  return <View style={styles.summary}><Text style={[styles.summaryValue, { color }]}>{value}</Text><Text style={styles.summaryLabel}>{label}</Text></View>;
+}
+
+function AttentionCard({ alert }: { alert: ProductionAlert }) {
+  const critical = alert.severity === 'critical';
+  const color = critical ? C3S_COLORS.danger : C3S_COLORS.warning;
   return (
-    <C3SCard borderColor="#2F6D8A">
-      <Text style={styles.cardTitle}>{title}</Text>
-      {rows.map((r) => <Text key={`${title}-${r}`} style={styles.rowText}>{r}</Text>)}
-      <Pressable style={styles.goBtn} onPress={onGo}>
-        <Text style={styles.goBtnText}>Go to {title}</Text>
-      </Pressable>
-    </C3SCard>
+    <Pressable style={[styles.attention, { borderLeftColor: color }]} onPress={() => router.push(`/production-item?id=${encodeURIComponent(alert.itemId)}` as Href)}>
+      <View style={styles.attentionTop}><Text style={[styles.attentionLabel, { color }]}>{critical ? 'ACTION REQUIRED' : 'NEEDS ATTENTION'}</Text><Text style={styles.chevron}>›</Text></View>
+      <Text style={styles.attentionTitle}>{alert.title}</Text>
+      <Text style={styles.attentionMessage}>{alert.message}</Text>
+    </Pressable>
   );
 }
 
-function ListCard({ children, empty }: { children: React.ReactNode; empty: string }) {
-  const hasChildren = Array.isArray(children) ? children.length > 0 : Boolean(children);
-  return (
-    <C3SCard borderColor="#30363D">
-      {hasChildren ? children : <Text style={styles.empty}>{empty}</Text>}
-    </C3SCard>
-  );
-}
+function Empty({ text }: { text: string }) { return <View style={styles.empty}><Text style={styles.emptyText}>{text}</Text></View>; }
+function QuickAction({ label, route }: { label: string; route: string }) { return <Pressable style={styles.quickAction} onPress={() => router.push(route as Href)}><Text style={styles.quickActionText}>{label}</Text><Text style={styles.quickChevron}>›</Text></Pressable>; }
 
 const styles = StyleSheet.create({
-  content: { gap: 8, paddingBottom: 24 },
-  devTitle: { color: '#FFB4B4', fontSize: 12, fontWeight: '800', marginBottom: 4 },
-  devActions: { flexDirection: 'row', gap: 8, marginTop: 6, alignItems: 'center' },
-  devDangerBtn: {
-    borderWidth: 1,
-    borderColor: '#C62828',
-    backgroundColor: '#2A1414',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    alignSelf: 'flex-start',
-  },
-  devDangerBtnText: { color: '#FFB4B4', fontSize: 12, fontWeight: '700' },
-  devCancelBtn: {
-    borderWidth: 1,
-    borderColor: '#455A64',
-    backgroundColor: '#1A2430',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-  },
-  devCancelBtnText: { color: '#C9D1D9', fontSize: 12, fontWeight: '700' },
-  refreshBtn: {
-    borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  refreshText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
-  sectionTitle: { color: '#8AB4F8', fontSize: 13, fontWeight: '800', marginTop: 4 },
-  grid: { gap: 8 },
-  cardTitle: { color: '#E6EDF3', fontSize: 14, fontWeight: '800', marginBottom: 4 },
-  rowText: { color: '#AAB4BE', fontSize: 12, marginBottom: 2 },
-  eventRow: { borderTopWidth: 1, borderTopColor: '#30363D', paddingTop: 6, marginTop: 6 },
-  eventTime: { color: '#8B949E', fontSize: 11, fontFamily: 'Menlo' },
-  eventMeta: { color: '#9FD3FF', fontSize: 11, fontWeight: '700' },
-  goBtn: {
-    marginTop: 8,
-    borderWidth: 1,
-    borderColor: '#2F6D8A',
-    backgroundColor: '#13314A',
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    alignSelf: 'flex-start',
-  },
-  goBtnText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
-  info: { color: '#8B949E', fontSize: 12 },
-  error: { color: '#FF7B72', fontSize: 12, fontWeight: '700' },
-  empty: { color: '#8B949E', fontSize: 12 },
+  content: { width: '100%', maxWidth: 1080, alignSelf: 'center', gap: 11, paddingBottom: 32 },
+  sectionHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 5 },
+  sectionTitle: { color: C3S_COLORS.textStrong, fontSize: 21, fontWeight: '900', marginTop: 5 },
+  sectionCount: { color: C3S_COLORS.textMuted, fontSize: 15, fontWeight: '800' },
+  link: { color: C3S_COLORS.accent, fontSize: 15, fontWeight: '900' },
+  summaryRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 9 },
+  summary: { flex: 1, minWidth: 82, minHeight: 98, borderWidth: 1, borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panel, borderRadius: 14, padding: 12, justifyContent: 'center' },
+  summaryValue: { fontSize: 30, lineHeight: 34, fontWeight: '900' },
+  summaryLabel: { color: C3S_COLORS.textMuted, fontSize: 12, lineHeight: 15, fontWeight: '800', marginTop: 3 },
+  progressCard: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, backgroundColor: C3S_COLORS.navy, borderRadius: 14, padding: 12 },
+  progressItem: { minWidth: 72, flex: 1, alignItems: 'center', paddingVertical: 5 },
+  progressValue: { color: '#FFFFFF', fontSize: 22, fontWeight: '900' },
+  progressLabel: { color: '#A9C7EC', fontSize: 10, fontWeight: '900', marginTop: 2 },
+  quickGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 9 },
+  quickAction: { minHeight: 52, minWidth: 155, flexGrow: 1, flexBasis: '45%', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panel, borderRadius: 12, paddingHorizontal: 13 },
+  quickActionText: { color: C3S_COLORS.textStrong, fontSize: 14, fontWeight: '900', flexShrink: 1 },
+  quickChevron: { color: C3S_COLORS.accent, fontSize: 25, fontWeight: '700' },
+  attention: { backgroundColor: C3S_COLORS.panel, borderWidth: 1, borderColor: C3S_COLORS.border, borderLeftWidth: 5, borderRadius: 14, padding: 14 },
+  attentionTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  attentionLabel: { fontSize: 10, fontWeight: '900', letterSpacing: 0.8 },
+  attentionTitle: { color: C3S_COLORS.textStrong, fontSize: 17, fontWeight: '900', marginTop: 5 },
+  attentionMessage: { color: C3S_COLORS.textMuted, fontSize: 14, lineHeight: 20, fontWeight: '600', marginTop: 3 },
+  chevron: { color: C3S_COLORS.textMuted, fontSize: 26, lineHeight: 26 },
+  empty: { borderWidth: 1, borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panel, borderRadius: 14, padding: 17 },
+  emptyText: { color: C3S_COLORS.textMuted, fontSize: 14, fontWeight: '700' },
+  primaryButton: { minHeight: 56, backgroundColor: C3S_COLORS.accent, borderRadius: 14, alignItems: 'center', justifyContent: 'center', marginTop: 7 },
+  primaryButtonText: { color: '#FFFFFF', fontSize: 17, fontWeight: '900' },
+  error: { color: C3S_COLORS.danger, backgroundColor: C3S_COLORS.dangerSoft, borderRadius: 10, padding: 12, fontSize: 14, fontWeight: '700' },
 });

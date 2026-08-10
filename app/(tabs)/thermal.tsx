@@ -1,21 +1,21 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
-import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { router, useLocalSearchParams } from 'expo-router';
 
 import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import { C3SDisclosure, C3SOperatorFocus } from '@/components/operator-ui';
+import { StressScenarioBanner } from '@/components/stress-scenario-banner';
+import { C3S_COLORS } from '@/constants/c3s-ui';
 import {
   getSmokehouses,
-  getChillers,
-  holdPrepItem,
   repairStaleSmokehouseOccupancy,
   type SmokehouseItem,
-  type ChillerItem,
   type ThermalDeviationInput,
 } from '@/lib/firebase/repository';
 import { logFirebaseError, toOperatorMessage } from '@/lib/auth/diagnostics';
 import {
   getOperationalItems,
-  oItemAssignSmokehouseOnly,
   oItemAssignAndStartCook,
   oItemAllocateSmokehouseLoad,
   oItemVerifyLoad,
@@ -24,7 +24,6 @@ import {
   oItemRecordCriticalTemp,
   oItemRecordDuration,
   oItemEvacuateToChill,
-  oItemAdvanceRTCStatus,
   resolveSmokehouseDuplicates,
   type OItemItem,
 } from '@/lib/operational-items';
@@ -37,9 +36,9 @@ const ALL_SMOKEHOUSE_NAMES = ['D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 
 // Session-level operator identity cache
 let _sessionOnDutyAs = '';
 
-const STATUS_COLOR_READY = '#66BB6A';
-const STATUS_COLOR_ASSIGNED = '#FB8C00';
-const STATUS_COLOR_COOKING = '#EF5350';
+const STATUS_COLOR_READY = C3S_COLORS.success;
+const STATUS_COLOR_ASSIGNED = C3S_COLORS.warning;
+const STATUS_COLOR_COOKING = C3S_COLORS.danger;
 const ACTIVE_SMOKEHOUSE_STATUSES: readonly string[] = [
   'awaiting_cook_start',
   'cooking',
@@ -107,9 +106,10 @@ function isRackPoolParent(item: OItemItem): boolean {
 }
 
 export default function ThermalScreen() {
+  const params = useLocalSearchParams<{ itemId?: string }>();
+  const targetItemId = Array.isArray(params.itemId) ? params.itemId[0] : params.itemId;
   const [oItems, setOItems] = useState<OItemItem[]>([]);
   const [smokehouses, setSmokehouses] = useState<SmokehouseItem[]>([]);
-  const [chillers, setChillers] = useState<ChillerItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
@@ -132,9 +132,7 @@ export default function ThermalScreen() {
   const [allocatingLoadId, setAllocatingLoadId] = useState<string | null>(null);
 
   // Assignment — legacy (kept for Section 2 fallback)
-  const [assigningPrepId, setAssigningPrepId] = useState<string | null>(null);
   const [selectedSmokeByPrep, setSelectedSmokeByPrep] = useState<Record<string, string>>({});
-  const [assignError, setAssignError] = useState<Record<string, string>>({});
 
   // Verify Load
   const [verifyLoadBy, setVerifyLoadBy] = useState<Record<string, string>>({});
@@ -182,25 +180,14 @@ export default function ThermalScreen() {
   const loadData = useCallback(async () => {
     setIsLoading(true);
     setLoadError(null);
-    const results = await Promise.allSettled([getOperationalItems({ stage: 'thermal' }), getSmokehouses(), getChillers()]);
-    const [oR, smokeR, chlrR] = results;
+    const results = await Promise.allSettled([getOperationalItems({ stage: 'thermal' }), getSmokehouses()]);
+    const [oR, smokeR] = results;
     let thermalItems: OItemItem[] = [];
 
-    if (oR.status === 'fulfilled') {
-      thermalItems = oR.value;
-    } else {
-      // Fallback: if the stage-filtered query fails (index/rule mismatch), load all and filter client-side.
-      try {
-        const allItems = await getOperationalItems();
-        thermalItems = allItems.filter((x) => x.stage === 'thermal');
-      } catch {
-        thermalItems = [];
-      }
-    }
+    if (oR.status === 'fulfilled') thermalItems = oR.value;
 
     setOItems(thermalItems);
     if (smokeR.status === 'fulfilled') setSmokehouses(smokeR.value);
-    if (chlrR.status === 'fulfilled') setChillers(chlrR.value);
 
     const stages = Array.from(new Set(thermalItems.map((x) => x.stage ?? '—')));
     const statuses = Array.from(new Set(thermalItems.map((x) => x.status ?? '—')));
@@ -215,7 +202,7 @@ export default function ThermalScreen() {
 
     const firstFail = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
     if (firstFail) {
-      logFirebaseError('Thermal', 'operational_items/smokehouses/chillers', firstFail.reason);
+      logFirebaseError('Thermal', 'operational_items/smokehouses', firstFail.reason);
       if (__DEV__) {
         const err = firstFail.reason as { code?: string; message?: string; stack?: string };
         console.error('[THERMAL_LOAD_FAILED]', {
@@ -225,7 +212,7 @@ export default function ThermalScreen() {
         });
       }
       const hasDataViaFallback = thermalItems.length > 0 || oR.status === 'fulfilled';
-      if (!hasDataViaFallback || smokeR.status === 'rejected' || chlrR.status === 'rejected') {
+      if (!hasDataViaFallback || smokeR.status === 'rejected') {
         setLoadError(toOperatorMessage(firstFail.reason, 'Unable to load thermal data.'));
       }
     }
@@ -278,20 +265,20 @@ export default function ThermalScreen() {
   const readyForAssignment = useMemo(
     () => oItems
       .filter((p) => p.status === 'ready' || p.status === 'ready_for_thermal')
-      .sort((a, b) => (toMillis(a.startTime) ?? 0) - (toMillis(b.startTime) ?? 0)),
-    [oItems],
+      .sort((a, b) => Number(b.id === targetItemId) - Number(a.id === targetItemId) || (toMillis(a.startTime) ?? 0) - (toMillis(b.startTime) ?? 0)),
+    [oItems, targetItemId],
   );
   const assignedQueue = useMemo(
     () => oItems
       .filter((p) => p.status === 'assigned')
-      .sort((a, b) => (toMillis(a.startTime) ?? 0) - (toMillis(b.startTime) ?? 0)),
-    [oItems],
+      .sort((a, b) => Number(b.id === targetItemId) - Number(a.id === targetItemId) || (toMillis(a.startTime) ?? 0) - (toMillis(b.startTime) ?? 0)),
+    [oItems, targetItemId],
   );
   const liveExecution = useMemo(
     () => oItems
       .filter((p) => p.status === 'cooking')
-      .sort((a, b) => (toMillis(a.startTime) ?? 0) - (toMillis(b.startTime) ?? 0)),
-    [oItems],
+      .sort((a, b) => Number(b.id === targetItemId) - Number(a.id === targetItemId) || (toMillis(a.startTime) ?? 0) - (toMillis(b.startTime) ?? 0)),
+    [oItems, targetItemId],
   );
 
   function effectiveName(perBatch: string | undefined) {
@@ -299,37 +286,6 @@ export default function ThermalScreen() {
   }
 
   // ── Handlers ──────────────────────────────────────────────────────────────
-
-  async function onAssignSmokehouse(item: OItemItem) {
-    const smokeName = selectedSmokeByPrep[item.id] ?? '';
-    if (!smokeName) {
-      setAssignError((prev) => ({ ...prev, [item.id]: 'Select a smokehouse.' }));
-      return;
-    }
-    setAssignError((prev) => ({ ...prev, [item.id]: '' }));
-    setActionSuccess(null); setActionError(null);
-    try {
-      setAssigningPrepId(item.id);
-      const selected = smokehouseByName[smokeName] ?? null;
-      const capacity = smokehouseRackCapacity(selected);
-      if ((item.racks ?? 0) > capacity) {
-        setAssignError((prev) => ({
-          ...prev,
-          [item.id]: `This load exceeds smokehouse capacity. Split into ${Math.ceil((item.racks ?? 0) / capacity)} cook loads.`,
-        }));
-        return;
-      }
-      if (item.prepQueueId) {
-        await oItemAssignSmokehouseOnly(item.id, item.stage, item.status, item.prepQueueId, smokeName);
-      }
-      setActionSuccess(`${prepDisplayName(item)} assigned to Smokehouse ${smokeName}.`);
-      await loadData();
-    } catch (error) {
-      setAssignError((prev) => ({ ...prev, [item.id]: toOperatorMessage(error, 'Failed to assign.') }));
-    } finally {
-      setAssigningPrepId(null);
-    }
-  }
 
   // Combined Assign + Start Cook — used by Section 1 inline panel
   async function onAssignAndStartCook(item: OItemItem) {
@@ -451,16 +407,8 @@ export default function ThermalScreen() {
     }
   }
 
-  async function onSendBackToRtc(item: OItemItem) {
-    setActionSuccess(null); setActionError(null);
-    try {
-      if (item.prepQueueId) await holdPrepItem(item.prepQueueId, 'Returned by Thermal to RTC');
-      await oItemAdvanceRTCStatus(item.id, item.stage, item.status, 'hold');
-      setActionSuccess(`${prepDisplayName(item)} sent back to RTC / hold.`);
-      await loadData();
-    } catch (error) {
-      setActionError(toOperatorMessage(error, 'Failed to send back to RTC.'));
-    }
+  function onSendBackToRtc(item: OItemItem) {
+    router.push(`/hold?itemId=${encodeURIComponent(item.id)}&mode=place`);
   }
 
   /** DEV-only: resolve duplicate active child loads assigned to the same smokehouse. */
@@ -738,6 +686,14 @@ export default function ThermalScreen() {
             </Pressable>
           )}
         />
+        <StressScenarioBanner />
+
+        <C3SOperatorFocus
+          status={`${liveExecution.length} cooking • ${assignedQueue.length} ready to start`}
+          action={liveExecution.length > 0 ? 'Record Check' : assignedQueue.length > 0 ? 'Start Cook' : readyForAssignment.length > 0 ? 'Start Cook' : 'No Action Required'}
+          detail={readyForAssignment.length > 0 ? `${readyForAssignment.length} batch${readyForAssignment.length === 1 ? '' : 'es'} need smokehouse assignment.` : 'Required thermal steps remain in their validated sequence.'}
+          tone={liveExecution.some((item) => item.hasDeviation || item.status === 'hold') ? 'critical' : liveExecution.length + assignedQueue.length + readyForAssignment.length > 0 ? 'active' : 'complete'}
+        />
 
         {/* On Duty As */}
         <View style={styles.onDutyRow}>
@@ -745,7 +701,7 @@ export default function ThermalScreen() {
           <TextInput
             style={[styles.onDutyInput, !onDutyAs.trim() && styles.onDutyInputEmpty]}
             placeholder="Your name — pre-fills operator fields this session"
-            placeholderTextColor="#6E7681"
+            placeholderTextColor={C3S_COLORS.textMuted}
             value={onDutyAs}
             onChangeText={handleOnDutyChange}
             autoCorrect={false}
@@ -785,7 +741,7 @@ export default function ThermalScreen() {
             const itemAllocatedRacks = item.allocatedRackCount ?? 0;
             const itemRemainingRacks = item.remainingRackCount ?? Math.max(0, itemOriginalRacks - itemAllocatedRacks);
             return (
-            <C3SCard key={item.id} borderColor={itemIsParent ? '#1F5A9E' : STATUS_COLOR_READY}>
+            <C3SCard key={item.id} borderColor={itemIsParent ? C3S_COLORS.accent : STATUS_COLOR_READY}>
               {/* Rack-pool parent banner */}
               {itemIsParent ? (
                 <View style={styles.rackPoolBanner}>
@@ -799,12 +755,13 @@ export default function ThermalScreen() {
                   <Text style={styles.product}>{prepDisplayName(item)}</Text>
                   {item.hasDeviation ? <Text style={styles.emptySub}>⚠ Deviation Recorded</Text> : null}
                 </View>
-                <View style={[styles.pill, { backgroundColor: itemIsParent ? '#0D1A2E' : '#1B3320', borderColor: itemIsParent ? '#1F5A9E' : '#2E7D32' }]}>
-                  <Text style={[styles.pillText, { color: itemIsParent ? '#64B5F6' : '#7EE787' }]}>
+                <View style={[styles.pill, { backgroundColor: itemIsParent ? C3S_COLORS.accentSoft : C3S_COLORS.successSoft, borderColor: itemIsParent ? C3S_COLORS.accent : C3S_COLORS.success }]}>
+                  <Text style={[styles.pillText, { color: itemIsParent ? C3S_COLORS.accent : C3S_COLORS.success }]}>
                     {itemIsParent ? 'STAGED POOL' : 'READY FOR THERMAL'}
                   </Text>
                 </View>
               </View>
+              <C3SDisclosure>
               <View style={styles.metaRow}><Text style={styles.metaLabel}>Cook Profile</Text><Text style={styles.metaValue}>{item.cookType} · {item.targetTemp}°F target · {item.expectedCookMinutes}m expected</Text></View>
               <View style={styles.metaRow}><Text style={styles.metaLabel}>Product Code</Text><Text style={styles.metaValue}>{item.productCodeSnapshot ?? item.productCode ?? '—'}</Text></View>
               <View style={styles.metaRow}><Text style={styles.metaLabel}>Process Order</Text><Text style={styles.metaValue}>{item.processOrder ?? item.poNumber ?? '—'}</Text></View>
@@ -818,7 +775,9 @@ export default function ThermalScreen() {
               <View style={styles.metaRow}><Text style={styles.metaLabel}>Probe-out Temp</Text><Text style={styles.metaValue}>{item.criticalTempValue ?? '—'}</Text></View>
               <View style={styles.metaRow}><Text style={styles.metaLabel}>PO / Make Date</Text><Text style={styles.metaValue}>{item.poNumber} · {item.makeDate}</Text></View>
               <View style={styles.metaRow}><Text style={styles.metaLabel}>Delivery Date</Text><Text style={styles.metaValue}>{item.deliveryDate ?? '—'}</Text></View>
+              </C3SDisclosure>
               <View style={styles.buttonRow}>
+                <Pressable style={[styles.secondaryButton, { flex: 1 }]} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><Text style={styles.secondaryButtonText}>Open Batch</Text></Pressable>
                 <Pressable style={[styles.secondaryButton, { flex: 1 }]} onPress={() => onSendBackToRtc(item)}>
                   <Text style={styles.secondaryButtonText}>Send Back / Hold</Text>
                 </Pressable>
@@ -901,7 +860,7 @@ export default function ThermalScreen() {
                             </View>
                             <View style={styles.metaRow}>
                               <Text style={styles.metaLabel}>Remaining Racks</Text>
-                              <Text style={[styles.metaValue, { color: '#7EE787' }]}>{remainingRacks}</Text>
+                              <Text style={[styles.metaValue, { color: C3S_COLORS.success }]}>{remainingRacks}</Text>
                             </View>
                           </View>
                         ) : null}
@@ -920,7 +879,7 @@ export default function ThermalScreen() {
                                 <Text style={styles.metaValue}>Selected Smokehouse: {selectedName}</Text>
                                 <Text style={styles.metaValue}>Capacity: {capacity} racks</Text>
                                 <Text style={styles.metaValue}>Racks to Load: {allocRacks}</Text>
-                                <Text style={[styles.metaValue, { color: '#7EE787' }]}>
+                                <Text style={[styles.metaValue, { color: C3S_COLORS.success }]}>
                                   Remaining After Load: {remainingRacks - allocRacks}
                                 </Text>
                               </View>
@@ -960,7 +919,7 @@ export default function ThermalScreen() {
                             <TextInput
                               style={styles.input}
                               placeholder="e.g. 165°F — required to start cook"
-                              placeholderTextColor="#6E7681"
+                              placeholderTextColor={C3S_COLORS.textMuted}
                               keyboardType="numeric"
                               value={assignPanelTemp[item.id] ?? ''}
                               onChangeText={(v) => setAssignPanelTemp((prev) => ({ ...prev, [item.id]: v }))}
@@ -970,7 +929,7 @@ export default function ThermalScreen() {
                             <TextInput
                               style={styles.input}
                               placeholder="e.g. 38°F — leave blank if not recorded"
-                              placeholderTextColor="#6E7681"
+                              placeholderTextColor={C3S_COLORS.textMuted}
                               keyboardType="numeric"
                               value={assignPanelProductTemp[item.id] ?? ''}
                               onChangeText={(v) => setAssignPanelProductTemp((prev) => ({ ...prev, [item.id]: v }))}
@@ -990,7 +949,7 @@ export default function ThermalScreen() {
                                 disabled={assignAndStartingId === item.id}
                                 onPress={() => onAssignAndStartCook(item)}>
                                 <Text style={styles.primaryActionText}>
-                                  {assignAndStartingId === item.id ? 'Starting Cook...' : 'Assign & Start Cook'}
+                                  {assignAndStartingId === item.id ? 'Starting Cook...' : 'Start Cook'}
                                 </Text>
                               </Pressable>
                             </View>
@@ -1016,14 +975,14 @@ export default function ThermalScreen() {
                 styles.secondaryButton,
                 {
                   marginBottom: 8,
-                  borderColor: '#4A90D9',
-                  backgroundColor: '#0D1A2E',
+                  borderColor: C3S_COLORS.accent,
+                  backgroundColor: C3S_COLORS.accentSoft,
                   opacity: repairingOccupancy ? 0.5 : 1,
                 },
               ]}
               onPress={onRepairSmokehouseOccupancy}
               disabled={repairingOccupancy}>
-              <Text style={[styles.secondaryButtonText, { color: '#64B5F6', fontWeight: '700' }]}>
+              <Text style={[styles.secondaryButtonText, { color: C3S_COLORS.accent, fontWeight: '700' }]}>
                 {repairingOccupancy ? 'Repairing...' : '🔧 Repair Smokehouse Occupancy'}
               </Text>
             </Pressable>
@@ -1031,12 +990,12 @@ export default function ThermalScreen() {
 
           {/* DEV: duplicate-child warning + one-tap cleanup */}
           {__DEV__ && Object.keys(smokehouseDuplicates).length > 0 ? (
-            <View style={[styles.emptyCard, { borderColor: '#FF6B35', backgroundColor: '#1F0A00' }]}>
-              <Text style={[styles.emptyTitle, { color: '#FF8C5A' }]}>
+            <View style={[styles.emptyCard, { borderColor: C3S_COLORS.danger, backgroundColor: C3S_COLORS.warningSoft }]}>
+              <Text style={[styles.emptyTitle, { color: C3S_COLORS.warning }]}>
                 ⚠ DEV: Duplicate Active Loads Detected
               </Text>
               {Object.entries(smokehouseDuplicates).map(([house, dupes]) => (
-                <Text key={house} style={[styles.emptySub, { color: '#FFB86B' }]}>
+                <Text key={house} style={[styles.emptySub, { color: C3S_COLORS.warning }]}>
                   Smokehouse {house}: {dupes.length} active loads ({dupes.map((d) => d.id.slice(0, 6)).join(', ')})
                 </Text>
               ))}
@@ -1045,14 +1004,14 @@ export default function ThermalScreen() {
                   styles.secondaryButton,
                   {
                     marginTop: 10,
-                    borderColor: '#FF6B35',
-                    backgroundColor: '#3A1400',
+                    borderColor: C3S_COLORS.danger,
+                    backgroundColor: C3S_COLORS.dangerSoft,
                     opacity: resolvingDuplicates ? 0.5 : 1,
                   },
                 ]}
                 onPress={onResolveSmokehouseDuplicates}
                 disabled={resolvingDuplicates}>
-                <Text style={[styles.secondaryButtonText, { color: '#FF8C5A', fontWeight: '700' }]}>
+                <Text style={[styles.secondaryButtonText, { color: C3S_COLORS.warning, fontWeight: '700' }]}>
                   {resolvingDuplicates ? 'Resolving...' : 'Resolve Duplicate Smokehouse Loads'}
                 </Text>
               </Pressable>
@@ -1089,7 +1048,7 @@ export default function ThermalScreen() {
               blockReason = `active-status-conflict:${siblingConflict.id}:${siblingConflict.status}`;
             }
             if (__DEV__) {
-              // eslint-disable-next-line no-console
+
               console.log('[THERMAL_OCCUPANCY_CHECK]', {
                 smokehouseName: item.assignedSmokehouse ?? null,
                 currentLoadId: smokehouse?.currentLoadId ?? null,
@@ -1114,7 +1073,7 @@ export default function ThermalScreen() {
                 ? (__DEV__ ? ' [stale occupancy]' : ` [${smokehouse.status}]`)
                 : ` [${smokehouse.status}]`;
             return (
-              <C3SCard key={item.id} borderColor={isChildLoad ? '#1F5A9E' : STATUS_COLOR_ASSIGNED}>
+              <C3SCard key={item.id} borderColor={isChildLoad ? C3S_COLORS.accent : STATUS_COLOR_ASSIGNED}>
                 {/* Child load banner */}
                 {isChildLoad ? (
                   <View style={styles.childLoadBanner}>
@@ -1128,8 +1087,8 @@ export default function ThermalScreen() {
                     <Text style={styles.product}>{prepDisplayName(item)}</Text>
                     {item.hasDeviation ? <Text style={styles.emptySub}>⚠ Deviation Recorded</Text> : null}
                   </View>
-                  <View style={[styles.pill, { backgroundColor: isChildLoad ? '#0D1A2E' : '#3A260F', borderColor: isChildLoad ? '#1F5A9E' : '#B26A00' }]}>
-                    <Text style={[styles.pillText, { color: isChildLoad ? '#64B5F6' : '#FFB86B' }]}>
+                  <View style={[styles.pill, { backgroundColor: isChildLoad ? C3S_COLORS.accentSoft : C3S_COLORS.warningSoft, borderColor: isChildLoad ? C3S_COLORS.accent : C3S_COLORS.warning }]}>
+                    <Text style={[styles.pillText, { color: isChildLoad ? C3S_COLORS.accent : C3S_COLORS.warning }]}>
                       {isChildLoad ? 'CHILD LOAD' : 'ASSIGNED'}
                     </Text>
                   </View>
@@ -1138,7 +1097,7 @@ export default function ThermalScreen() {
                   <Text style={styles.metaLabel}>Smokehouse</Text>
                   <Text style={[
                     styles.metaValue,
-                    (smokehouse?.currentLoadId && !smokehouseLoadMatch) ? { color: '#FF8C5A' } : undefined,
+                    (smokehouse?.currentLoadId && !smokehouseLoadMatch) ? { color: C3S_COLORS.warning } : undefined,
                   ]}>
                     {item.assignedSmokehouse ?? 'Unassigned'}{smokehouseStatusLabel}
                   </Text>
@@ -1148,7 +1107,7 @@ export default function ThermalScreen() {
                   <>
                     <View style={styles.metaRow}>
                       <Text style={styles.metaLabel}>Assigned Racks</Text>
-                      <Text style={[styles.metaValue, { color: '#7EE787' }]}>
+                      <Text style={[styles.metaValue, { color: C3S_COLORS.success }]}>
                         {item.assignedRackCount ?? item.racks} rack{(item.assignedRackCount ?? item.racks ?? 1) === 1 ? '' : 's'}
                       </Text>
                     </View>
@@ -1158,9 +1117,12 @@ export default function ThermalScreen() {
                     </View>
                   </>
                 ) : null}
+                <C3SDisclosure>
                 <View style={styles.metaRow}><Text style={styles.metaLabel}>Cook Profile</Text><Text style={styles.metaValue}>{item.cookType} · {item.targetTemp}°F · {item.expectedCookMinutes}m expected</Text></View>
                 {!isChildLoad ? <View style={styles.metaRow}><Text style={styles.metaLabel}>Racks / Pieces</Text><Text style={styles.metaValue}>{item.racks} racks · {item.pieces} pcs</Text></View> : null}
                 <View style={styles.metaRow}><Text style={styles.metaLabel}>Delivery Date</Text><Text style={styles.metaValue}>{item.deliveryDate ?? '—'}</Text></View>
+                </C3SDisclosure>
+                <Pressable style={styles.secondaryButton} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><Text style={styles.secondaryButtonText}>Open Batch</Text></Pressable>
                 {/* DEV: occupancy identity debug — shows IDs and currentLoadId match status */}
                 {__DEV__ ? (
                   <View style={styles.devDebugBox}>
@@ -1176,10 +1138,10 @@ export default function ThermalScreen() {
                       styles.devDebugText,
                       {
                         color: !smokehouse?.currentLoadId
-                          ? '#7EE787'
+                          ? C3S_COLORS.success
                           : smokehouseLoadMatch
-                            ? '#7EE787'
-                            : '#FF6B35',
+                            ? C3S_COLORS.success
+                            : C3S_COLORS.danger,
                       },
                     ]}>
                       {'Occupancy Match: '}
@@ -1203,7 +1165,7 @@ export default function ThermalScreen() {
                     <View style={styles.inputRow}>
                       <TextInput style={styles.input}
                         placeholder={onDutyAs.trim() ? `${onDutyAs} (tap to override)` : 'Your name'}
-                        placeholderTextColor={onDutyAs.trim() ? '#5A7A5A' : '#6E7681'}
+                        placeholderTextColor={onDutyAs.trim() ? C3S_COLORS.textMuted : C3S_COLORS.textMuted}
                         value={verifyLoadBy[item.id] ?? ''}
                         onChangeText={(v) => setVerifyLoadBy((prev) => ({ ...prev, [item.id]: v }))}
                         autoCorrect={false} autoCapitalize="words" />
@@ -1220,7 +1182,7 @@ export default function ThermalScreen() {
                 <View style={styles.inputRow}>
                   <TextInput style={styles.input}
                     placeholder="Starting chamber temp (°F) — required"
-                    placeholderTextColor="#6E7681"
+                    placeholderTextColor={C3S_COLORS.textMuted}
                     keyboardType="numeric"
                     value={startingTempInput[item.id] ?? ''}
                     onChangeText={(v) => setStartingTempInput((prev) => ({ ...prev, [item.id]: v }))} />
@@ -1258,7 +1220,7 @@ export default function ThermalScreen() {
 
             const cookingIsChild = !!item.parentLoadId;
             return (
-              <C3SCard key={item.id} borderColor={item.thermalDeviations?.length ? '#FF6B35' : STATUS_COLOR_COOKING}>
+              <C3SCard key={item.id} borderColor={item.thermalDeviations?.length ? C3S_COLORS.danger : STATUS_COLOR_COOKING}>
                 {/* Child load banner */}
                 {cookingIsChild ? (
                   <View style={styles.childLoadBanner}>
@@ -1276,8 +1238,8 @@ export default function ThermalScreen() {
                       <Text style={styles.deviationBadgeText}>⚠ DEVIATION</Text>
                     </View>
                   ) : null}
-                  <View style={[styles.pill, { backgroundColor: '#2D1111', borderColor: '#7A2020' }]}>
-                    <Text style={[styles.pillText, { color: '#FF8A8A' }]}>COOK IN PROGRESS</Text>
+                  <View style={[styles.pill, { backgroundColor: C3S_COLORS.dangerSoft, borderColor: C3S_COLORS.danger }]}>
+                    <Text style={[styles.pillText, { color: C3S_COLORS.danger }]}>COOK IN PROGRESS</Text>
                   </View>
                 </View>
 
@@ -1291,13 +1253,14 @@ export default function ThermalScreen() {
                   </View>
                 ) : null}
 
+                <C3SDisclosure>
                 <View style={styles.metaRow}><Text style={styles.metaLabel}>Smokehouse</Text><Text style={styles.metaValue}>{item.assignedSmokehouse ?? '—'}</Text></View>
                 {/* Child-specific cook metadata */}
                 {cookingIsChild ? (
                   <>
                     <View style={styles.metaRow}>
                       <Text style={styles.metaLabel}>Assigned Racks</Text>
-                      <Text style={[styles.metaValue, { color: '#7EE787' }]}>
+                      <Text style={[styles.metaValue, { color: C3S_COLORS.success }]}>
                         {item.assignedRackCount ?? item.racks} rack{(item.assignedRackCount ?? item.racks ?? 1) === 1 ? '' : 's'}
                       </Text>
                     </View>
@@ -1312,6 +1275,8 @@ export default function ThermalScreen() {
                 <View style={styles.metaRow}><Text style={styles.metaLabel}>Delivery Date</Text><Text style={styles.metaValue}>{item.deliveryDate ?? '—'}</Text></View>
                 {item.startingTemp != null ? <View style={styles.metaRow}><Text style={styles.metaLabel}>Chamber Temp</Text><Text style={styles.metaValue}>{item.startingTemp}°F (smokehouse)</Text></View> : null}
                 {item.startingProductTemp != null ? <View style={styles.metaRow}><Text style={styles.metaLabel}>Product Temp</Text><Text style={styles.metaValue}>{item.startingProductTemp}°F (product in)</Text></View> : null}
+                </C3SDisclosure>
+                <Pressable style={styles.secondaryButton} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><Text style={styles.secondaryButtonText}>Open Batch</Text></Pressable>
                 {blocked ? <Text style={styles.errorText}>⚠ Equipment: {blocked}</Text> : null}
 
                 {/* Step 3 — 50°F Cut */}
@@ -1328,7 +1293,7 @@ export default function ThermalScreen() {
                     {cut50PanelOpenId !== item.id ? (
                       <Pressable style={styles.stepButton} disabled={cut50LoadingId === item.id}
                         onPress={() => { setCut50Error((p) => ({ ...p, [item.id]: '' })); setCut50PanelOpenId(item.id); }}>
-                        <Text style={styles.stepButtonText}>Enter Observed Temp → Record Cut</Text>
+                        <Text style={styles.stepButtonText}>Record Check</Text>
                       </Pressable>
                     ) : (
                       <View style={styles.cut50Panel}>
@@ -1337,7 +1302,7 @@ export default function ThermalScreen() {
                         <TextInput
                           style={styles.input}
                           placeholder="e.g. 50°F"
-                          placeholderTextColor="#6E7681"
+                          placeholderTextColor={C3S_COLORS.textMuted}
                           keyboardType="numeric"
                           autoFocus
                           value={cut50TempInput[item.id] ?? ''}
@@ -1350,11 +1315,11 @@ export default function ThermalScreen() {
                             <Text style={styles.deviationPanelTitle}>⚠ Record Deviation to Proceed</Text>
                             <Text style={styles.deviationPanelHint}>Out-of-range temp recorded. Supervisor approval required to continue.</Text>
                             <TextInput style={styles.input} placeholder="Reason / notes (required)"
-                              placeholderTextColor="#6E7681" multiline autoCorrect={false}
+                              placeholderTextColor={C3S_COLORS.textMuted} multiline autoCorrect={false}
                               value={deviationNotes[`${item.id}:cut50`] ?? ''}
                               onChangeText={(v) => setDeviationNotes((prev) => ({ ...prev, [`${item.id}:cut50`]: v }))} />
                             <TextInput style={styles.input} placeholder="Supervisor name or initials (required)"
-                              placeholderTextColor="#6E7681" autoCorrect={false} autoCapitalize="words"
+                              placeholderTextColor={C3S_COLORS.textMuted} autoCorrect={false} autoCapitalize="words"
                               value={deviationSupervisor[`${item.id}:cut50`] ?? ''}
                               onChangeText={(v) => setDeviationSupervisor((prev) => ({ ...prev, [`${item.id}:cut50`]: v }))} />
                             {deviationError[`${item.id}:cut50`] ? <Text style={styles.errorText}>{deviationError[`${item.id}:cut50`]}</Text> : null}
@@ -1381,7 +1346,7 @@ export default function ThermalScreen() {
                               disabled={cut50LoadingId === item.id}
                               onPress={() => do50Cut(item)}>
                               <Text style={styles.stepButtonText}>
-                                {cut50LoadingId === item.id ? 'Recording...' : 'Confirm 50°F Cut'}
+                                {cut50LoadingId === item.id ? 'Recording...' : 'Record Check'}
                               </Text>
                             </Pressable>
                           </View>
@@ -1407,7 +1372,7 @@ export default function ThermalScreen() {
                     {cut130PanelOpenId !== item.id ? (
                       <Pressable style={styles.stepButton} disabled={cut130LoadingId === item.id}
                         onPress={() => { setCut130Error((p) => ({ ...p, [item.id]: '' })); setCut130PanelOpenId(item.id); }}>
-                        <Text style={styles.stepButtonText}>{exceeded6h ? '⚠ Enter Temp → Record Deviation' : 'Enter Observed Temp → Record Cut'}</Text>
+                        <Text style={styles.stepButtonText}>{exceeded6h ? '⚠ Record Deviation' : 'Record Check'}</Text>
                       </Pressable>
                     ) : (
                       <View style={styles.cut50Panel}>
@@ -1416,7 +1381,7 @@ export default function ThermalScreen() {
                         <TextInput
                           style={styles.input}
                           placeholder="e.g. 130°F"
-                          placeholderTextColor="#6E7681"
+                          placeholderTextColor={C3S_COLORS.textMuted}
                           keyboardType="numeric"
                           autoFocus
                           value={cut130TempInput[item.id] ?? ''}
@@ -1429,11 +1394,11 @@ export default function ThermalScreen() {
                             <Text style={styles.deviationPanelTitle}>⚠ Record Deviation to Proceed</Text>
                             <Text style={styles.deviationPanelHint}>Out-of-range condition detected. Supervisor approval required to continue.</Text>
                             <TextInput style={styles.input} placeholder="Reason / notes (required)"
-                              placeholderTextColor="#6E7681" multiline autoCorrect={false}
+                              placeholderTextColor={C3S_COLORS.textMuted} multiline autoCorrect={false}
                               value={deviationNotes[`${item.id}:cut130`] ?? ''}
                               onChangeText={(v) => setDeviationNotes((prev) => ({ ...prev, [`${item.id}:cut130`]: v }))} />
                             <TextInput style={styles.input} placeholder="Supervisor name or initials (required)"
-                              placeholderTextColor="#6E7681" autoCorrect={false} autoCapitalize="words"
+                              placeholderTextColor={C3S_COLORS.textMuted} autoCorrect={false} autoCapitalize="words"
                               value={deviationSupervisor[`${item.id}:cut130`] ?? ''}
                               onChangeText={(v) => setDeviationSupervisor((prev) => ({ ...prev, [`${item.id}:cut130`]: v }))} />
                             {deviationError[`${item.id}:cut130`] ? <Text style={styles.errorText}>{deviationError[`${item.id}:cut130`]}</Text> : null}
@@ -1460,7 +1425,7 @@ export default function ThermalScreen() {
                               disabled={cut130LoadingId === item.id}
                               onPress={() => do130Cut(item)}>
                               <Text style={styles.stepButtonText}>
-                                {cut130LoadingId === item.id ? 'Recording...' : 'Confirm 130°F Cut'}
+                                {cut130LoadingId === item.id ? 'Recording...' : 'Record Check'}
                               </Text>
                             </Pressable>
                           </View>
@@ -1496,7 +1461,7 @@ export default function ThermalScreen() {
                               key={i}
                               style={[styles.probeInput, passes && styles.probeInputPass, fails && styles.probeInputFail]}
                               placeholder={`Probe ${i + 1} (°F)`}
-                              placeholderTextColor="#6E7681"
+                              placeholderTextColor={C3S_COLORS.textMuted}
                               keyboardType="numeric"
                               value={probes[i] ?? ''}
                               onChangeText={(v) => {
@@ -1517,7 +1482,7 @@ export default function ThermalScreen() {
                       ) : null}
                       <TextInput style={[styles.input, { marginTop: 6 }]}
                         placeholder={onDutyAs.trim() ? `${onDutyAs} (tap to override)` : 'Verified by'}
-                        placeholderTextColor={onDutyAs.trim() ? '#5A7A5A' : '#6E7681'}
+                        placeholderTextColor={onDutyAs.trim() ? C3S_COLORS.textMuted : C3S_COLORS.textMuted}
                         value={critTempVerifiedBy[item.id] ?? ''}
                         onChangeText={(v) => setCritTempVerifiedBy((prev) => ({ ...prev, [item.id]: v }))}
                         autoCorrect={false} autoCapitalize="words" />
@@ -1528,11 +1493,11 @@ export default function ThermalScreen() {
                           <Text style={styles.deviationPanelTitle}>⚠ Record Deviation to Proceed</Text>
                           <Text style={styles.deviationPanelHint}>One or more probes below required target. Supervisor approval required to continue.</Text>
                           <TextInput style={styles.input} placeholder="Reason / notes (required)"
-                            placeholderTextColor="#6E7681" multiline autoCorrect={false}
+                            placeholderTextColor={C3S_COLORS.textMuted} multiline autoCorrect={false}
                             value={deviationNotes[`${item.id}:critical_temp`] ?? ''}
                             onChangeText={(v) => setDeviationNotes((prev) => ({ ...prev, [`${item.id}:critical_temp`]: v }))} />
                           <TextInput style={styles.input} placeholder="Supervisor name or initials (required)"
-                            placeholderTextColor="#6E7681" autoCorrect={false} autoCapitalize="words"
+                            placeholderTextColor={C3S_COLORS.textMuted} autoCorrect={false} autoCapitalize="words"
                             value={deviationSupervisor[`${item.id}:critical_temp`] ?? ''}
                             onChangeText={(v) => setDeviationSupervisor((prev) => ({ ...prev, [`${item.id}:critical_temp`]: v }))} />
                           {deviationError[`${item.id}:critical_temp`] ? <Text style={styles.errorText}>{deviationError[`${item.id}:critical_temp`]}</Text> : null}
@@ -1552,7 +1517,7 @@ export default function ThermalScreen() {
                           style={[styles.stepButton, { opacity: recordingCritTempId === item.id ? 0.5 : 1 }]}
                           disabled={recordingCritTempId === item.id}
                           onPress={() => onCriticalTemp(item)}>
-                          <Text style={styles.stepButtonText}>{recordingCritTempId === item.id ? 'Recording...' : 'Record Probe Completion'}</Text>
+                          <Text style={styles.stepButtonText}>{recordingCritTempId === item.id ? 'Recording...' : 'Record Check'}</Text>
                         </Pressable>
                       )}
                     </>
@@ -1644,17 +1609,17 @@ export default function ThermalScreen() {
 const styles = StyleSheet.create({
   refreshBtn: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
-  refreshBtnText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
+  refreshBtnText: { color: C3S_COLORS.textPrimary, fontSize: 12, fontWeight: '700' },
   onDutyRow: {
     borderWidth: 1,
-    borderColor: '#2F6D3A',
-    backgroundColor: '#0E1F12',
+    borderColor: C3S_COLORS.success,
+    backgroundColor: C3S_COLORS.successSoft,
     borderRadius: 10,
     paddingHorizontal: 10,
     paddingVertical: 8,
@@ -1662,123 +1627,124 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   onDutyLabel: {
-    color: '#7EE787',
+    color: C3S_COLORS.success,
     fontSize: 11,
     fontWeight: '800',
     textTransform: 'uppercase',
     letterSpacing: 0.5,
   },
   onDutyInput: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 14,
     fontWeight: '700',
     paddingVertical: 2,
   },
-  onDutyInputEmpty: { color: '#6E7681', fontWeight: '600', fontStyle: 'italic' },
-  summaryRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
+  onDutyInputEmpty: { color: C3S_COLORS.textMuted, fontWeight: '600', fontStyle: 'italic' },
+  summaryRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 },
   summaryCard: {
     flex: 1,
+    minWidth: 110,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     paddingVertical: 8,
     paddingHorizontal: 8,
     minHeight: 80,
   },
   summaryAccent: { height: 3, width: 36, borderRadius: 8, marginBottom: 6 },
-  summaryValue: { color: '#F0F6FC', fontSize: 24, fontWeight: '800', lineHeight: 28 },
-  summaryLabel: { color: '#9DA7B1', fontSize: 11, fontWeight: '700', marginTop: 2 },
+  summaryValue: { color: C3S_COLORS.textStrong, fontSize: 24, fontWeight: '800', lineHeight: 28 },
+  summaryLabel: { color: C3S_COLORS.textMuted, fontSize: 11, fontWeight: '700', marginTop: 2 },
   listContent: { gap: 10, paddingBottom: 18 },
-  sectionTitle: { color: '#E6EDF3', fontSize: 17, fontWeight: '800', marginTop: 8, marginBottom: 2 },
-  sectionSub: { color: '#8B949E', fontSize: 12, fontWeight: '600', marginBottom: 6 },
-  infoText: { color: '#8B949E', fontSize: 13, fontWeight: '700' },
-  errorText: { color: '#FF7B72', fontSize: 12, fontWeight: '700', marginTop: 2 },
-  successText: { color: '#7EE787', fontSize: 13, fontWeight: '700' },
-  warningText: { color: '#FFB86B', fontSize: 12, fontWeight: '700', marginTop: 2 },
-  nextStep: { color: '#64B5F6', fontSize: 12, fontWeight: '700', marginTop: 6 },
+  sectionTitle: { color: C3S_COLORS.textStrong, fontSize: 19, fontWeight: '900', marginTop: 8, marginBottom: 2 },
+  sectionSub: { color: C3S_COLORS.textMuted, fontSize: 12, fontWeight: '600', marginBottom: 6 },
+  infoText: { color: C3S_COLORS.textMuted, fontSize: 13, fontWeight: '700' },
+  errorText: { color: C3S_COLORS.danger, fontSize: 12, fontWeight: '700', marginTop: 2 },
+  successText: { color: C3S_COLORS.success, fontSize: 13, fontWeight: '700' },
+  warningText: { color: C3S_COLORS.warning, fontSize: 12, fontWeight: '700', marginTop: 2 },
+  nextStep: { color: C3S_COLORS.accent, fontSize: 12, fontWeight: '700', marginTop: 6 },
   timerBanner: {
-    backgroundColor: '#1A0E05',
+    backgroundColor: C3S_COLORS.warningSoft,
     borderWidth: 1,
-    borderColor: '#7A2020',
+    borderColor: C3S_COLORS.danger,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 8,
     marginBottom: 8,
   },
-  timerText: { color: '#FF8A8A', fontSize: 16, fontWeight: '800' },
-  timerSub: { color: '#FFB86B', fontSize: 12, fontWeight: '700', marginTop: 2 },
+  timerText: { color: C3S_COLORS.danger, fontSize: 16, fontWeight: '800' },
+  timerSub: { color: C3S_COLORS.warning, fontSize: 12, fontWeight: '700', marginTop: 2 },
   emptyCard: {
-    borderWidth: 1, borderColor: '#30363D', borderRadius: 12,
-    backgroundColor: '#151A21', padding: 14, gap: 4,
+    borderWidth: 1, borderColor: C3S_COLORS.border, borderRadius: 12,
+    backgroundColor: C3S_COLORS.panel, padding: 14, gap: 4,
   },
-  emptyTitle: { color: '#E6EDF3', fontSize: 16, fontWeight: '800' },
-  emptySub: { color: '#9DA7B1', fontSize: 13, fontWeight: '600' },
-  cardTopRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
-  product: { color: '#F0F6FC', fontSize: 19, fontWeight: '800' },
-  batchId: { color: '#9DA7B1', fontSize: 13, fontWeight: '700', marginTop: 2 },
+  emptyTitle: { color: C3S_COLORS.textStrong, fontSize: 16, fontWeight: '800' },
+  emptySub: { color: C3S_COLORS.textMuted, fontSize: 13, fontWeight: '600' },
+  cardTopRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  product: { color: C3S_COLORS.textStrong, fontSize: 19, fontWeight: '800' },
+  batchId: { color: C3S_COLORS.textMuted, fontSize: 13, fontWeight: '700', marginTop: 2 },
   pill: {
     borderWidth: 1, borderRadius: 999, paddingHorizontal: 10,
     minHeight: 26, justifyContent: 'center',
   },
   pillText: { fontSize: 12, fontWeight: '800' },
-  metaRow: { flexDirection: 'row', marginTop: 4, gap: 8 },
-  metaLabel: { color: '#9DA7B1', fontSize: 13, fontWeight: '600', minWidth: 120 },
-  metaValue: { color: '#E6EDF3', fontSize: 14, fontWeight: '700', flex: 1 },
+  metaRow: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 4, gap: 4 },
+  metaLabel: { color: C3S_COLORS.textMuted, fontSize: 13, fontWeight: '600', minWidth: 104 },
+  metaValue: { color: C3S_COLORS.textPrimary, fontSize: 14, fontWeight: '700', flex: 1 },
   stepHeader: {
-    color: '#9DA7B1', fontSize: 11, fontWeight: '700',
+    color: C3S_COLORS.textMuted, fontSize: 11, fontWeight: '700',
     textTransform: 'uppercase', marginTop: 10, marginBottom: 4, letterSpacing: 0.5,
   },
-  stepHint: { color: '#7A8A96', fontSize: 12, fontWeight: '600', marginBottom: 4, fontStyle: 'italic' },
-  stepDone: { color: '#7EE787', fontSize: 13, fontWeight: '600', marginTop: 6 },
+  stepHint: { color: C3S_COLORS.textMuted, fontSize: 12, fontWeight: '600', marginBottom: 4, fontStyle: 'italic' },
+  stepDone: { color: C3S_COLORS.success, fontSize: 13, fontWeight: '600', marginTop: 6 },
   inputRow: { flexDirection: 'row', gap: 8, marginTop: 4, flexWrap: 'wrap' },
   input: {
-    flex: 1, minWidth: 100, borderWidth: 1, borderColor: '#30363D',
-    borderRadius: 8, backgroundColor: '#0D1117', color: '#E6EDF3',
+    flex: 1, minWidth: 100, borderWidth: 1, borderColor: C3S_COLORS.border,
+    borderRadius: 8, backgroundColor: C3S_COLORS.panel, color: C3S_COLORS.textPrimary,
     fontSize: 13, paddingHorizontal: 10, paddingVertical: 6, marginTop: 4,
   },
   stepButton: {
-    borderWidth: 1, borderColor: '#FB8C00', backgroundColor: '#2A1800',
+    borderWidth: 1, borderColor: C3S_COLORS.warning, backgroundColor: C3S_COLORS.warningSoft,
     borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8,
     alignItems: 'center', justifyContent: 'center', marginTop: 4,
   },
-  stepButtonText: { color: '#FFD580', fontSize: 12, fontWeight: '700' },
-  buttonRow: { flexDirection: 'row', gap: 8, marginTop: 4 },
+  stepButtonText: { color: C3S_COLORS.warning, fontSize: 12, fontWeight: '700' },
+  buttonRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
   chipWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
   chip: {
-    borderWidth: 1, borderColor: '#30363D', backgroundColor: '#151A21',
+    borderWidth: 1, borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panel,
     borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6,
   },
-  chipActive: { borderColor: '#FB8C00', backgroundColor: '#2A1800' },
-  chipText: { color: '#AAB4BE', fontSize: 12, fontWeight: '700' },
-  chipTextActive: { color: '#FFD580' },
-  chipSub: { color: '#6E7681', fontSize: 10, fontWeight: '600', marginTop: 1 },
+  chipActive: { borderColor: C3S_COLORS.warning, backgroundColor: C3S_COLORS.warningSoft },
+  chipText: { color: C3S_COLORS.textMuted, fontSize: 12, fontWeight: '700' },
+  chipTextActive: { color: C3S_COLORS.warning },
+  chipSub: { color: C3S_COLORS.textMuted, fontSize: 10, fontWeight: '600', marginTop: 1 },
 
   // Assign smokehouse inline panel
   assignSmokeButton: {
-    borderWidth: 1, borderColor: '#FB8C00', backgroundColor: '#2A1800',
+    borderWidth: 1, borderColor: C3S_COLORS.warning, backgroundColor: C3S_COLORS.warningSoft,
     borderRadius: 10, minHeight: 44, alignItems: 'center', justifyContent: 'center', marginTop: 10,
   },
-  assignSmokeButtonText: { color: '#FFD580', fontSize: 14, fontWeight: '800' },
+  assignSmokeButtonText: { color: C3S_COLORS.warning, fontSize: 14, fontWeight: '800' },
   assignPanel: {
-    marginTop: 10, backgroundColor: '#130D00', borderWidth: 1,
-    borderColor: '#5C3A00', borderRadius: 10, padding: 14,
+    marginTop: 10, backgroundColor: C3S_COLORS.warningSoft, borderWidth: 1,
+    borderColor: C3S_COLORS.warning, borderRadius: 10, padding: 14,
   },
   assignPanelTitle: {
-    color: '#9DA7B1', fontSize: 11, fontWeight: '700',
+    color: C3S_COLORS.textMuted, fontSize: 11, fontWeight: '700',
     textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2,
   },
   tempFieldHint: {
-    color: '#6E7681', fontSize: 11, fontStyle: 'italic', marginBottom: 5,
+    color: C3S_COLORS.textMuted, fontSize: 11, fontStyle: 'italic', marginBottom: 5,
   },
 
   // Step 3 — 50°F Cut inline panel
   cut50Panel: {
-    marginTop: 8, backgroundColor: '#0D1A0F', borderWidth: 1,
-    borderColor: '#1F6B2E', borderRadius: 10, padding: 12,
+    marginTop: 8, backgroundColor: C3S_COLORS.successSoft, borderWidth: 1,
+    borderColor: C3S_COLORS.success, borderRadius: 10, padding: 12,
   },
   cut50PanelLabel: {
-    color: '#9DA7B1', fontSize: 11, fontWeight: '700',
+    color: C3S_COLORS.textMuted, fontSize: 11, fontWeight: '700',
     textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2,
   },
 
@@ -1788,71 +1754,71 @@ const styles = StyleSheet.create({
   },
   smokeChip: {
     width: 72, height: 60,
-    borderWidth: 1.5, borderColor: '#30363D', backgroundColor: '#151A21',
+    borderWidth: 1.5, borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panel,
     borderRadius: 10, alignItems: 'center', justifyContent: 'center',
   },
   smokeChipActive: {
-    borderColor: '#FB8C00', backgroundColor: '#2A1800',
+    borderColor: C3S_COLORS.warning, backgroundColor: C3S_COLORS.warningSoft,
   },
   smokeChipBusy: {
-    borderColor: '#30363D', backgroundColor: '#0F1117', opacity: 0.55,
+    borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panelAlt, opacity: 0.55,
   },
   smokeChipCleaning: {
-    borderColor: '#30363D', backgroundColor: '#0F1117', opacity: 0.4,
+    borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panelAlt, opacity: 0.4,
   },
   smokeChipName: {
-    color: '#C9D1D9', fontSize: 18, fontWeight: '800',
+    color: C3S_COLORS.textPrimary, fontSize: 18, fontWeight: '800',
   },
-  smokeChipNameActive: { color: '#FFD580' },
-  smokeChipNameDim: { color: '#484F58' },
+  smokeChipNameActive: { color: C3S_COLORS.warning },
+  smokeChipNameDim: { color: C3S_COLORS.textMuted },
   smokeChipStatus: {
-    color: '#6E7681', fontSize: 9, fontWeight: '600',
+    color: C3S_COLORS.textMuted, fontSize: 9, fontWeight: '600',
     textTransform: 'uppercase', letterSpacing: 0.3, marginTop: 2,
   },
   secondaryButton: {
-    borderWidth: 1, borderColor: '#30363D', backgroundColor: '#151A21',
+    borderWidth: 1, borderColor: C3S_COLORS.border, backgroundColor: C3S_COLORS.panel,
     borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8,
     alignItems: 'center', justifyContent: 'center', marginTop: 4,
   },
-  secondaryButtonText: { color: '#8B949E', fontSize: 13, fontWeight: '700' },
+  secondaryButtonText: { color: C3S_COLORS.textMuted, fontSize: 13, fontWeight: '700' },
 
   primaryAction: {
-    borderRadius: 10, minHeight: 40, borderWidth: 1,
-    borderColor: '#FB8C00', backgroundColor: '#2A1800',
+    borderRadius: 10, minHeight: 50, borderWidth: 1,
+    borderColor: C3S_COLORS.warning, backgroundColor: C3S_COLORS.warningSoft,
     alignItems: 'center', justifyContent: 'center', marginTop: 8,
   },
-  primaryActionText: { color: '#FFD580', fontSize: 13, fontWeight: '700' },
+  primaryActionText: { color: C3S_COLORS.warning, fontSize: 13, fontWeight: '700' },
 
   // 4-probe grid (Step 6)
   probeGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4 },
   probeInput: {
-    width: '47%', borderWidth: 1, borderColor: '#30363D',
-    borderRadius: 8, backgroundColor: '#0D1117', color: '#E6EDF3',
+    width: '47%', borderWidth: 1, borderColor: C3S_COLORS.border,
+    borderRadius: 8, backgroundColor: C3S_COLORS.panel, color: C3S_COLORS.textPrimary,
     fontSize: 13, paddingHorizontal: 10, paddingVertical: 8, minHeight: 42,
   },
-  probeInputPass: { borderColor: '#7EE787', backgroundColor: '#0D2A14' },
-  probeInputFail: { borderColor: '#EF5350', backgroundColor: '#2A0D0D' },
-  probeAllPass: { color: '#7EE787', fontSize: 13, fontWeight: '700', marginTop: 4 },
-  probeFailWarning: { color: '#EF5350', fontSize: 13, fontWeight: '700', marginTop: 4 },
+  probeInputPass: { borderColor: C3S_COLORS.success, backgroundColor: C3S_COLORS.successSoft },
+  probeInputFail: { borderColor: C3S_COLORS.danger, backgroundColor: C3S_COLORS.dangerSoft },
+  probeAllPass: { color: C3S_COLORS.success, fontSize: 13, fontWeight: '700', marginTop: 4 },
+  probeFailWarning: { color: C3S_COLORS.danger, fontSize: 13, fontWeight: '700', marginTop: 4 },
   finishAction: {
     borderRadius: 10, minHeight: 42, borderWidth: 1,
-    borderColor: '#26A69A', backgroundColor: '#113132',
+    borderColor: C3S_COLORS.success, backgroundColor: C3S_COLORS.successSoft,
     alignItems: 'center', justifyContent: 'center', marginTop: 8,
   },
-  finishActionText: { color: '#D4F5F7', fontSize: 13, fontWeight: '700' },
+  finishActionText: { color: C3S_COLORS.textPrimary, fontSize: 13, fontWeight: '700' },
 
   // ── Rack pool parent indicator (Section 1 card top) ──────────────────────
   rackPoolBanner: {
-    backgroundColor: '#0D1A2E',
+    backgroundColor: C3S_COLORS.accentSoft,
     borderWidth: 1,
-    borderColor: '#1F5A9E',
+    borderColor: C3S_COLORS.accent,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 6,
     marginBottom: 8,
   },
   rackPoolBannerText: {
-    color: '#64B5F6',
+    color: C3S_COLORS.accent,
     fontSize: 12,
     fontWeight: '800',
     letterSpacing: 0.3,
@@ -1860,9 +1826,9 @@ const styles = StyleSheet.create({
 
   // ── Rack pool breakdown box inside assign panel ────────────────────────────
   rackPoolInfoBox: {
-    backgroundColor: '#0D1A2E',
+    backgroundColor: C3S_COLORS.accentSoft,
     borderWidth: 1,
-    borderColor: '#1F5A9E',
+    borderColor: C3S_COLORS.accent,
     borderRadius: 8,
     padding: 10,
     marginTop: 6,
@@ -1871,9 +1837,9 @@ const styles = StyleSheet.create({
 
   // ── Load preview box (shows per-smokehouse allocation preview) ─────────────
   loadPreviewBox: {
-    backgroundColor: '#0D200F',
+    backgroundColor: C3S_COLORS.successSoft,
     borderWidth: 1,
-    borderColor: '#2E7D32',
+    borderColor: C3S_COLORS.success,
     borderRadius: 8,
     padding: 10,
     marginTop: 8,
@@ -1883,16 +1849,16 @@ const styles = StyleSheet.create({
 
   // ── Child load banner (Sections 2 & 3 cards) ──────────────────────────────
   childLoadBanner: {
-    backgroundColor: '#0D1A2E',
+    backgroundColor: C3S_COLORS.accentSoft,
     borderWidth: 1,
-    borderColor: '#1F5A9E',
+    borderColor: C3S_COLORS.accent,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 5,
     marginBottom: 8,
   },
   childLoadBannerText: {
-    color: '#64B5F6',
+    color: C3S_COLORS.accent,
     fontSize: 12,
     fontWeight: '800',
     letterSpacing: 0.3,
@@ -1900,37 +1866,37 @@ const styles = StyleSheet.create({
 
   // ── Deviation badge (on card header) ─────────────────────────────────────
   deviationBadge: {
-    borderWidth: 1, borderColor: '#FF6B35', backgroundColor: '#3A1400',
+    borderWidth: 1, borderColor: C3S_COLORS.danger, backgroundColor: C3S_COLORS.dangerSoft,
     borderRadius: 6, paddingHorizontal: 8, paddingVertical: 3,
     marginRight: 6, alignSelf: 'flex-start',
   },
-  deviationBadgeText: { color: '#FF8C5A', fontSize: 11, fontWeight: '800', letterSpacing: 0.5 },
+  deviationBadgeText: { color: C3S_COLORS.warning, fontSize: 11, fontWeight: '800', letterSpacing: 0.5 },
 
   // ── Deviation panel (inline, inside step panels) ──────────────────────────
   deviationPanel: {
-    marginTop: 8, borderWidth: 1, borderColor: '#FF6B35',
-    backgroundColor: '#1F0A00', borderRadius: 8, padding: 10, gap: 6,
+    marginTop: 8, borderWidth: 1, borderColor: C3S_COLORS.danger,
+    backgroundColor: C3S_COLORS.warningSoft, borderRadius: 8, padding: 10, gap: 6,
   },
-  deviationPanelTitle: { color: '#FF8C5A', fontSize: 13, fontWeight: '800', marginBottom: 2 },
-  deviationPanelHint: { color: '#9DA7B1', fontSize: 12, fontWeight: '500', marginBottom: 4 },
+  deviationPanelTitle: { color: C3S_COLORS.warning, fontSize: 13, fontWeight: '800', marginBottom: 2 },
+  deviationPanelHint: { color: C3S_COLORS.textMuted, fontSize: 12, fontWeight: '500', marginBottom: 4 },
   deviationSubmitButton: {
-    borderRadius: 8, borderWidth: 1, borderColor: '#FF6B35', backgroundColor: '#3A1400',
+    borderRadius: 8, borderWidth: 1, borderColor: C3S_COLORS.danger, backgroundColor: C3S_COLORS.dangerSoft,
     alignItems: 'center', justifyContent: 'center', paddingVertical: 9, marginTop: 4,
   },
-  deviationSubmitText: { color: '#FF8C5A', fontSize: 13, fontWeight: '800' },
+  deviationSubmitText: { color: C3S_COLORS.warning, fontSize: 13, fontWeight: '800' },
 
   // ── DEV: occupancy identity debug box (Section 2 child cards) ────────────
   devDebugBox: {
     marginTop: 8,
-    backgroundColor: '#0D1117',
+    backgroundColor: C3S_COLORS.panelAlt,
     borderWidth: 1,
-    borderColor: '#21262D',
+    borderColor: C3S_COLORS.border,
     borderRadius: 6,
     padding: 8,
     gap: 2,
   },
   devDebugText: {
-    color: '#6E7681',
+    color: C3S_COLORS.textMuted,
     fontSize: 11,
     fontWeight: '600',
     fontFamily: 'monospace',

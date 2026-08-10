@@ -2,8 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { Timestamp } from 'firebase/firestore';
+import { router, useLocalSearchParams } from 'expo-router';
 
 import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import { C3SDisclosure, C3SOperatorFocus } from '@/components/operator-ui';
+import { C3S_COLORS } from '@/constants/c3s-ui';
 import { logFirebaseError, toOperatorMessage } from '@/lib/auth/diagnostics';
 import { normalizePrepStatus, prepStatusLabel } from '@/lib/flow/status';
 import {
@@ -12,13 +15,7 @@ import {
 } from '@/lib/products';
 import {
   getSmokehouses,
-  createPrepQueueItem,
   deletePrepQueueItem,
-  markPrepQueueItemReady,
-  markReadyForThermal,
-  movePrepDownstream,
-  startPrep,
-  holdPrepItem,
   getWeeklyPlanItems,
   type SmokehouseItem,
   type WeeklyPlanItem,
@@ -26,7 +23,7 @@ import {
 import {
   getOperationalItems,
   oItemAdvanceRTCStatus,
-  oItemCreateManual,
+  oItemCreateManualFromInput,
   type OItemItem,
 } from '@/lib/operational-items';
 
@@ -34,19 +31,19 @@ import {
 let _sessionCreatedBy = '';
 
 const statusColors: Record<string, string> = {
-  staging: '#90A4AE',
-  ready: '#66BB6A',
-  assigned: '#42A5F5',
-  cooking: '#FB8C00',
-  awaiting_chill: '#26A69A',
-  staged: '#90A4AE',
-  prepping: '#FFB74D',
-  ready_for_thermal: '#66BB6A',
-  in_thermal: '#42A5F5',
-  moved_downstream: '#29B6F6',
-  hold: '#EF5350',
-  complete: '#43A047',
-  packaging_complete: '#43A047',
+  staging: C3S_COLORS.textMuted,
+  ready: C3S_COLORS.success,
+  assigned: C3S_COLORS.accent,
+  cooking: C3S_COLORS.warning,
+  awaiting_chill: C3S_COLORS.success,
+  staged: C3S_COLORS.textMuted,
+  prepping: C3S_COLORS.warning,
+  ready_for_thermal: C3S_COLORS.success,
+  in_thermal: C3S_COLORS.accent,
+  moved_downstream: C3S_COLORS.accent,
+  hold: C3S_COLORS.danger,
+  complete: C3S_COLORS.success,
+  packaging_complete: C3S_COLORS.success,
 };
 
 function prepDisplayName(item: OItemItem) {
@@ -79,6 +76,8 @@ function rtcTrailActiveStep(status: OItemItem['status']): number {
 }
 
 export default function PrepQueueScreen() {
+  const params = useLocalSearchParams<{ itemId?: string }>();
+  const targetItemId = Array.isArray(params.itemId) ? params.itemId[0] : params.itemId;
   const [oItems, setOItems] = useState<OItemItem[]>([]);
   const [smokehouses, setSmokehouses] = useState<SmokehouseItem[]>([]);
   const [profiles, setProfiles] = useState<ProductProfile[]>([]);
@@ -122,7 +121,7 @@ export default function PrepQueueScreen() {
       );
       setOItems(visible);
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.log('[RTC] loaded operational_items (rtc+thermal)', visible.map((i) => ({
           id: i.id, prepQueueId: i.prepQueueId, stage: i.stage, status: i.status,
           productName: i.productName,
@@ -154,9 +153,9 @@ export default function PrepQueueScreen() {
 
   const orderedPrepItems = useMemo(
     () => [...oItems].sort(
-      (a, b) => (b.startTime?.toMillis?.() ?? 0) - (a.startTime?.toMillis?.() ?? 0),
+      (a, b) => Number(b.id === targetItemId) - Number(a.id === targetItemId) || (b.startTime?.toMillis?.() ?? 0) - (a.startTime?.toMillis?.() ?? 0),
     ),
-    [oItems],
+    [oItems, targetItemId],
   );
 
   const selectedProduct = profiles.find((p) => p.id === selectedProductId) ?? null;
@@ -182,7 +181,7 @@ export default function PrepQueueScreen() {
     try {
       setMarkingReadyId(item.id);
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.log('[RTC->Thermal][MarkReady] start', {
           oItemId: item.id,
           prepQueueId: item.prepQueueId ?? null,
@@ -192,14 +191,9 @@ export default function PrepQueueScreen() {
           nextStatus: 'ready_for_thermal',
         });
       }
-      const prepId = item.prepQueueId;
-      if (prepId) {
-        if (item.status === 'staging' || item.status === 'staged') await markPrepQueueItemReady(prepId);
-        else await markReadyForThermal(prepId);
-      }
       await oItemAdvanceRTCStatus(item.id, item.stage, item.status, 'ready_for_thermal');
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.log('[RTC->Thermal][MarkReady] success', {
           oItemId: item.id,
           prepQueueId: item.prepQueueId ?? null,
@@ -212,7 +206,7 @@ export default function PrepQueueScreen() {
     } catch (error) {
       if (__DEV__) {
         const e = error as { code?: string; message?: string };
-        // eslint-disable-next-line no-console
+
         console.error('[RTC->Thermal][MarkReady] failed', {
           oItemId: item.id,
           prepQueueId: item.prepQueueId ?? null,
@@ -234,7 +228,6 @@ export default function PrepQueueScreen() {
     setActionError(null);
     setActionSuccess(null);
     try {
-      if (item.prepQueueId) await startPrep(item.prepQueueId);
       await oItemAdvanceRTCStatus(item.id, item.stage, item.status, 'prepping');
       setActionSuccess(`${prepDisplayName(item)} moved to In Prep.`);
       await loadData();
@@ -248,7 +241,7 @@ export default function PrepQueueScreen() {
     setActionSuccess(null);
     try {
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.log('[RTC->Thermal][MovedDownstream] start', {
           oItemId: item.id,
           prepQueueId: item.prepQueueId ?? null,
@@ -258,16 +251,9 @@ export default function PrepQueueScreen() {
           nextStatus: 'ready_for_thermal',
         });
       }
-      // Legacy compatibility: promote prep_queue row into thermal-ready state.
-      // This keeps old queries consistent and avoids invalid OItem transition prep->moved_downstream.
-      if (item.prepQueueId) {
-        await markReadyForThermal(item.prepQueueId);
-      } else {
-        throw new Error('Missing prepQueueId for downstream handoff.');
-      }
       await oItemAdvanceRTCStatus(item.id, item.stage, item.status, 'ready_for_thermal');
       if (__DEV__) {
-        // eslint-disable-next-line no-console
+
         console.log('[RTC->Thermal][MovedDownstream] success', {
           oItemId: item.id,
           prepQueueId: item.prepQueueId ?? null,
@@ -280,7 +266,7 @@ export default function PrepQueueScreen() {
     } catch (error) {
       if (__DEV__) {
         const e = error as { code?: string; message?: string };
-        // eslint-disable-next-line no-console
+
         console.error('[RTC->Thermal][MovedDownstream] failed', {
           oItemId: item.id,
           prepQueueId: item.prepQueueId ?? null,
@@ -296,17 +282,8 @@ export default function PrepQueueScreen() {
     }
   }
 
-  async function onHold(item: OItemItem) {
-    setActionError(null);
-    setActionSuccess(null);
-    try {
-      if (item.prepQueueId) await holdPrepItem(item.prepQueueId, 'Placed on hold by RTC');
-      await oItemAdvanceRTCStatus(item.id, item.stage, item.status, 'hold');
-      setActionSuccess(`${prepDisplayName(item)} placed on hold.`);
-      await loadData();
-    } catch (error) {
-      setActionError(toOperatorMessage(error, 'Failed to hold prep item.'));
-    }
+  function onHold(item: OItemItem) {
+    router.push(`/hold?itemId=${encodeURIComponent(item.id)}&mode=place`);
   }
 
   // ── Delete / Remove ──
@@ -357,7 +334,7 @@ export default function PrepQueueScreen() {
 
     setIsCreating(true);
     try {
-      const newPrepId = await createPrepQueueItem({
+      await oItemCreateManualFromInput({
         productId: selectedProduct.id,
         productName: selectedProduct.productName,
         productNameSnapshot: selectedProduct.productName,
@@ -390,10 +367,6 @@ export default function PrepQueueScreen() {
         thermalOwner: '',
         department: 'manual',
       });
-      // Also create an operational_items doc for this manually-entered prep.
-      // oItemCreateManual reads the prep doc and builds the OItem record.
-      await oItemCreateManual(newPrepId);
-
       // Reset form
       setSelectedProductId('');
       setProductSearch('');
@@ -459,27 +432,34 @@ export default function PrepQueueScreen() {
           )}
         />
 
+        <C3SOperatorFocus
+          status={`${stagingCount + prepCount + readyCount} active in RTC`}
+          action={holdCount > 0 ? 'Resolve Hold' : prepCount > 0 ? 'Send to Thermal' : stagingCount > 0 ? 'Start Prep' : readyCount > 0 ? 'Start Cook' : 'No Action Required'}
+          detail={holdCount > 0 ? `${holdCount} item${holdCount === 1 ? '' : 's'} cannot move forward.` : 'The highest-priority queue is shown first below.'}
+          tone={holdCount > 0 ? 'critical' : stagingCount + prepCount + readyCount > 0 ? 'active' : 'complete'}
+        />
+
         {/* ── Summary Pills ── */}
         <View style={styles.summaryRow}>
-          <View style={[styles.summaryPill, { borderColor: '#90A4AE' }]}>
-            <Text style={[styles.summaryCount, { color: '#CFD8DC' }]}>{stagingCount}</Text>
-            <Text style={[styles.summaryLabel, { color: '#90A4AE' }]}>Sent from Planning</Text>
+          <View style={[styles.summaryPill, { borderColor: C3S_COLORS.textMuted }]}>
+            <Text style={[styles.summaryCount, { color: C3S_COLORS.textPrimary }]}>{stagingCount}</Text>
+            <Text style={[styles.summaryLabel, { color: C3S_COLORS.textMuted }]}>Sent from Planning</Text>
           </View>
-          <View style={[styles.summaryPill, { borderColor: '#66BB6A' }]}>
-            <Text style={[styles.summaryCount, { color: '#FFD180' }]}>{prepCount}</Text>
-            <Text style={[styles.summaryLabel, { color: '#FFB74D' }]}>In Prep</Text>
+          <View style={[styles.summaryPill, { borderColor: C3S_COLORS.success }]}>
+            <Text style={[styles.summaryCount, { color: C3S_COLORS.warning }]}>{prepCount}</Text>
+            <Text style={[styles.summaryLabel, { color: C3S_COLORS.warning }]}>In Prep</Text>
           </View>
-          <View style={[styles.summaryPill, { borderColor: '#FB8C00' }]}>
-            <Text style={[styles.summaryCount, { color: '#A5D6A7' }]}>{readyCount}</Text>
-            <Text style={[styles.summaryLabel, { color: '#66BB6A' }]}>Ready for Thermal</Text>
+          <View style={[styles.summaryPill, { borderColor: C3S_COLORS.warning }]}>
+            <Text style={[styles.summaryCount, { color: C3S_COLORS.success }]}>{readyCount}</Text>
+            <Text style={[styles.summaryLabel, { color: C3S_COLORS.success }]}>Ready for Thermal</Text>
           </View>
-          <View style={[styles.summaryPill, { borderColor: '#29B6F6' }]}>
-            <Text style={[styles.summaryCount, { color: '#81D4FA' }]}>{movedCount}</Text>
-            <Text style={[styles.summaryLabel, { color: '#29B6F6' }]}>Moved Downstream</Text>
+          <View style={[styles.summaryPill, { borderColor: C3S_COLORS.accent }]}>
+            <Text style={[styles.summaryCount, { color: C3S_COLORS.accent }]}>{movedCount}</Text>
+            <Text style={[styles.summaryLabel, { color: C3S_COLORS.accent }]}>Moved Downstream</Text>
           </View>
-          <View style={[styles.summaryPill, { borderColor: '#EF5350' }]}>
-            <Text style={[styles.summaryCount, { color: '#FFAB91' }]}>{holdCount}</Text>
-            <Text style={[styles.summaryLabel, { color: '#EF5350' }]}>Hold</Text>
+          <View style={[styles.summaryPill, { borderColor: C3S_COLORS.danger }]}>
+            <Text style={[styles.summaryCount, { color: C3S_COLORS.danger }]}>{holdCount}</Text>
+            <Text style={[styles.summaryLabel, { color: C3S_COLORS.danger }]}>Hold</Text>
           </View>
         </View>
 
@@ -498,7 +478,7 @@ export default function PrepQueueScreen() {
 
         {/* ── Create Prep Form ── */}
         {showCreateForm ? (
-          <C3SCard borderColor="#42A5F5">
+          <C3SCard borderColor={C3S_COLORS.accent}>
             <Text style={styles.formTitle}>Manual Prep Entry</Text>
 
             {/* Creator */}
@@ -506,7 +486,7 @@ export default function PrepQueueScreen() {
             <TextInput
               style={styles.fieldInput}
               placeholder="Your name"
-              placeholderTextColor="#6E7681"
+              placeholderTextColor={C3S_COLORS.textMuted}
               value={createBy}
               onChangeText={(v) => { setCreateBy(v); _sessionCreatedBy = v; }}
               autoCorrect={false}
@@ -518,7 +498,7 @@ export default function PrepQueueScreen() {
             <TextInput
               style={styles.fieldInput}
               placeholder="Search product code or name"
-              placeholderTextColor="#6E7681"
+              placeholderTextColor={C3S_COLORS.textMuted}
               value={productSearch}
               onChangeText={setProductSearch}
               autoCorrect={false}
@@ -556,7 +536,7 @@ export default function PrepQueueScreen() {
             <TextInput
               style={styles.fieldInput}
               placeholder="e.g. PO-20260501"
-              placeholderTextColor="#6E7681"
+              placeholderTextColor={C3S_COLORS.textMuted}
               value={createPoNumber}
               onChangeText={setCreatePoNumber}
               autoCorrect={false}
@@ -569,7 +549,7 @@ export default function PrepQueueScreen() {
                 <TextInput
                   style={styles.fieldInput}
                   placeholder="YYYY-MM-DD"
-                  placeholderTextColor="#6E7681"
+                  placeholderTextColor={C3S_COLORS.textMuted}
                   value={createMakeDate}
                   onChangeText={setCreateMakeDate}
                   keyboardType="numbers-and-punctuation"
@@ -581,7 +561,7 @@ export default function PrepQueueScreen() {
                 <TextInput
                   style={styles.fieldInput}
                   placeholder="YYYY-MM-DD"
-                  placeholderTextColor="#6E7681"
+                  placeholderTextColor={C3S_COLORS.textMuted}
                   value={createDeliveryDate}
                   onChangeText={setCreateDeliveryDate}
                   keyboardType="numbers-and-punctuation"
@@ -596,7 +576,7 @@ export default function PrepQueueScreen() {
                 <TextInput
                   style={styles.fieldInput}
                   placeholder="1"
-                  placeholderTextColor="#6E7681"
+                  placeholderTextColor={C3S_COLORS.textMuted}
                   value={createRacks}
                   onChangeText={setCreateRacks}
                   keyboardType="numeric"
@@ -607,7 +587,7 @@ export default function PrepQueueScreen() {
                 <TextInput
                   style={styles.fieldInput}
                   placeholder="1"
-                  placeholderTextColor="#6E7681"
+                  placeholderTextColor={C3S_COLORS.textMuted}
                   value={createPieces}
                   onChangeText={setCreatePieces}
                   keyboardType="numeric"
@@ -628,12 +608,12 @@ export default function PrepQueueScreen() {
 
         {/* ── Action feedback ── */}
         {actionSuccess ? (
-          <C3SCard borderColor="#66BB6A">
+          <C3SCard borderColor={C3S_COLORS.success}>
             <Text style={styles.successText}>{actionSuccess}</Text>
           </C3SCard>
         ) : null}
         {actionError ? (
-          <C3SCard borderColor="#EF5350">
+          <C3SCard borderColor={C3S_COLORS.danger}>
             <Text style={styles.errorText}>{actionError}</Text>
           </C3SCard>
         ) : null}
@@ -645,7 +625,7 @@ export default function PrepQueueScreen() {
               <Text style={styles.infoText}>Loading Firestore prep queue…</Text>
             </C3SCard>
           ) : loadError ? (
-            <C3SCard borderColor="#EF5350">
+            <C3SCard borderColor={C3S_COLORS.danger}>
               <Text style={styles.errorText}>{loadError}</Text>
               <Pressable style={styles.retryButton} onPress={loadData}>
                 <Text style={styles.retryText}>Retry</Text>
@@ -712,6 +692,8 @@ export default function PrepQueueScreen() {
                       </View>
                     </View>
 
+                    <View style={styles.row}><Text style={styles.label}>Next Step</Text><Text style={[styles.value, { color: '#086BEA' }]}>{nextAction}</Text></View>
+                    <C3SDisclosure>
                     <View style={styles.row}><Text style={styles.label}>PO Number</Text><Text style={styles.value}>{item.poNumber}</Text></View>
                     <View style={styles.row}><Text style={styles.label}>Product Code</Text><Text style={styles.value}>{item.productCodeSnapshot ?? item.productCode ?? '—'}</Text></View>
                     <View style={styles.row}><Text style={styles.label}>Process Order</Text><Text style={styles.value}>{item.processOrder ?? item.poNumber ?? '—'}</Text></View>
@@ -731,7 +713,6 @@ export default function PrepQueueScreen() {
                     <View style={styles.row}><Text style={styles.label}>Target Temp</Text><Text style={styles.value}>{item.targetTemp}°F</Text></View>
                     <View style={styles.row}><Text style={styles.label}>Expected Cook</Text><Text style={styles.value}>{item.expectedCookMinutes} min</Text></View>
                     <View style={styles.row}><Text style={styles.label}>Smokehouse</Text><Text style={styles.value}>{item.assignedSmokehouse ?? 'Unassigned'}{linkedSmokehouse ? ` [${linkedSmokehouse.status}]` : ''}</Text></View>
-                    <View style={styles.row}><Text style={styles.label}>Next Step</Text><Text style={[styles.value, { color: '#81D4FA' }]}>{nextAction}</Text></View>
                     <View style={styles.trailRow}>
                       {rtcTrailSteps.map((step, idx) => {
                         const active = idx <= activeTrailStep;
@@ -742,6 +723,9 @@ export default function PrepQueueScreen() {
                         );
                       })}
                     </View>
+                    </C3SDisclosure>
+
+                    <Pressable style={[styles.actionButton, styles.readyButton]} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><Text style={styles.actionButtonText}>Open Batch</Text></Pressable>
 
                     {/* Actions */}
                     {canMarkReady || canDelete || isStaging || isPrepping ? (
@@ -757,10 +741,15 @@ export default function PrepQueueScreen() {
                             disabled={markingReadyId === item.id}
                             onPress={() => onMarkReady(item)}>
                             <Text style={styles.actionButtonText}>
-                              {markingReadyId === item.id ? 'Marking…' : 'Mark Ready'}
+                              {markingReadyId === item.id ? 'Saving…' : 'Send to Thermal'}
                             </Text>
                           </Pressable>
                         ) : null}
+                      </View>
+                    ) : null}
+                    {canDelete || isStaging || isPrepping ? (
+                      <C3SDisclosure title="Other actions">
+                        <View style={styles.actionsRow}>
                         {canDelete ? (
                           <Pressable
                             style={[styles.actionButton, styles.deleteButton, deletingId === item.id && styles.disabledButton]}
@@ -775,9 +764,10 @@ export default function PrepQueueScreen() {
                           <Text style={styles.actionButtonText}>Hold</Text>
                         </Pressable>
                         <Pressable style={[styles.actionButton, styles.readyButton]} onPress={() => onMoveDownstream(item)}>
-                          <Text style={styles.actionButtonText}>Moved Downstream</Text>
+                          <Text style={styles.actionButtonText}>Legacy Handoff</Text>
                         </Pressable>
                       </View>
+                      </C3SDisclosure>
                     ) : null}
                   </C3SCard>
                 );
@@ -796,26 +786,28 @@ export default function PrepQueueScreen() {
 const styles = StyleSheet.create({
   refreshBtn: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
-  refreshBtnText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
+  refreshBtnText: { color: C3S_COLORS.accent, fontSize: 12, fontWeight: '800' },
   // Summary
   summaryRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
     marginBottom: 10,
   },
   summaryPill: {
     flex: 1,
+    minWidth: 100,
     borderWidth: 1,
     borderRadius: 10,
     paddingVertical: 8,
     alignItems: 'center',
-    backgroundColor: '#151A21',
+    backgroundColor: C3S_COLORS.panel,
   },
   summaryCount: {
     fontSize: 22,
@@ -827,7 +819,7 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   sectionLabel: {
-    color: '#8AB4F8',
+    color: C3S_COLORS.accent,
     fontSize: 13,
     fontWeight: '800',
     marginTop: 8,
@@ -841,54 +833,54 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   createToggleLabel: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '700',
   },
   createToggleButton: {
     borderWidth: 1,
-    borderColor: '#2F6D8A',
-    backgroundColor: '#13314A',
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.accentSoft,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 7,
   },
   createToggleButtonActive: {
-    borderColor: '#455A64',
-    backgroundColor: '#1A2430',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panelAlt,
   },
   createToggleText: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 13,
     fontWeight: '700',
   },
 
   // Create form
   formTitle: {
-    color: '#81D4FA',
+    color: C3S_COLORS.accent,
     fontSize: 14,
     fontWeight: '800',
     marginBottom: 10,
   },
   fieldLabel: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '700',
     marginBottom: 4,
     marginTop: 10,
   },
   fieldHint: {
-    color: '#6E7681',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '600',
     marginBottom: 4,
   },
   fieldInput: {
-    backgroundColor: '#0D1117',
+    backgroundColor: C3S_COLORS.panel,
     borderWidth: 1,
-    borderColor: '#30363D',
+    borderColor: C3S_COLORS.border,
     borderRadius: 8,
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 14,
     fontWeight: '600',
     paddingHorizontal: 10,
@@ -907,32 +899,32 @@ const styles = StyleSheet.create({
   },
   chip: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 7,
   },
   chipActive: {
-    borderColor: '#42A5F5',
-    backgroundColor: '#0D2040',
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.accentSoft,
   },
   chipText: {
-    color: '#AAB4BE',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '700',
   },
   chipTextActive: {
-    color: '#90CAF9',
+    color: C3S_COLORS.accent,
   },
   chipDetailText: {
-    color: '#42A5F5',
+    color: C3S_COLORS.accent,
     fontSize: 11,
     fontWeight: '600',
     marginTop: 2,
   },
   sourceTag: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 11,
     fontWeight: '700',
     marginTop: 2,
@@ -945,54 +937,54 @@ const styles = StyleSheet.create({
   },
   trailChip: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#0D1117',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panelAlt,
     borderRadius: 6,
     paddingHorizontal: 6,
     paddingVertical: 3,
   },
   trailChipActive: {
-    borderColor: '#2F6D8A',
-    backgroundColor: '#13314A',
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.accentSoft,
   },
   trailChipText: {
-    color: '#6E7681',
+    color: C3S_COLORS.textMuted,
     fontSize: 10,
     fontWeight: '700',
   },
   trailChipTextActive: {
-    color: '#CDE8FF',
+    color: C3S_COLORS.textPrimary,
   },
   createSubmitButton: {
     marginTop: 14,
-    backgroundColor: '#1565C0',
+    backgroundColor: C3S_COLORS.accent,
     borderRadius: 10,
     minHeight: 48,
     alignItems: 'center',
     justifyContent: 'center',
   },
   createSubmitDisabled: {
-    backgroundColor: '#37474F',
+    backgroundColor: C3S_COLORS.textMuted,
   },
   createSubmitText: {
-    color: '#E6EDF3',
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '800',
   },
 
   // Action feedback
   successText: {
-    color: '#7EE787',
+    color: C3S_COLORS.success,
     fontSize: 13,
     fontWeight: '700',
   },
   errorText: {
-    color: '#FF7B72',
+    color: C3S_COLORS.danger,
     fontSize: 13,
     fontWeight: '700',
   },
   infoText: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '700',
   },
@@ -1011,12 +1003,12 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   productText: {
-    color: '#F0F6FC',
+    color: C3S_COLORS.textStrong,
     fontSize: 18,
     fontWeight: '800',
   },
   ticketId: {
-    color: '#9DA7B1',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '700',
     marginTop: 2,
@@ -1031,7 +1023,7 @@ const styles = StyleSheet.create({
     marginLeft: 8,
   },
   badgeText: {
-    color: '#0D1117',
+    color: '#FFFFFF',
     fontSize: 11,
     fontWeight: '800',
   },
@@ -1042,13 +1034,13 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   label: {
-    color: '#9DA7B1',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '600',
     minWidth: 120,
   },
   value: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 13,
     fontWeight: '700',
     flex: 1,
@@ -1062,51 +1054,51 @@ const styles = StyleSheet.create({
   },
   actionButton: {
     flex: 1,
-    minHeight: 42,
+    minHeight: 48,
     borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
   },
   readyButton: {
-    backgroundColor: '#1B5E20',
+    backgroundColor: C3S_COLORS.success,
     borderWidth: 1,
-    borderColor: '#2E7D32',
+    borderColor: C3S_COLORS.success,
   },
   deleteButton: {
-    backgroundColor: '#37474F',
+    backgroundColor: C3S_COLORS.textMuted,
     borderWidth: 1,
-    borderColor: '#546E7A',
+    borderColor: C3S_COLORS.textMuted,
   },
   disabledButton: {
     opacity: 0.5,
   },
   actionButtonText: {
-    color: '#E6EDF3',
+    color: '#FFFFFF',
     fontSize: 13,
     fontWeight: '800',
   },
 
   // Empty / retry
   emptyTitle: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textStrong,
     fontSize: 15,
     fontWeight: '800',
   },
   emptySub: {
-    color: '#9DA7B1',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '600',
     marginTop: 4,
   },
   retryButton: {
     marginTop: 8,
-    backgroundColor: '#1E3A5F',
+    backgroundColor: C3S_COLORS.accentSoft,
     borderRadius: 8,
     paddingVertical: 7,
     alignItems: 'center',
   },
   retryText: {
-    color: '#81D4FA',
+    color: C3S_COLORS.accent,
     fontSize: 13,
     fontWeight: '800',
   },

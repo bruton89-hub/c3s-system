@@ -1,16 +1,16 @@
 {
   "expo": {
-    "name": "c3s-preview",
+    "name": "C3S Production Flow",
     "slug": "c3s-preview",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "default",
-    "icon": "./assets/images/icon.png",
+    "icon": "./assets/images/c3s-app-icon.png",
     "scheme": "c3spreview",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "light",
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "buildNumber": "1",
+      "buildNumber": "8",
       "bundleIdentifier": "com.c3ssystem.preview",
       "requireFullScreen": false,
       "infoPlist": {
@@ -19,30 +19,26 @@
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/images/android-icon-foreground.png",
-        "backgroundImage": "./assets/images/android-icon-background.png",
-        "monochromeImage": "./assets/images/android-icon-monochrome.png"
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/images/c3s-app-icon.png"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false
     },
     "web": {
       "output": "static",
-      "favicon": "./assets/images/favicon.png"
+      "favicon": "./assets/images/c3s-app-icon.png"
     },
     "plugins": [
       "expo-router",
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
+          "image": "./assets/images/c3s-logo.png",
+          "imageWidth": 320,
           "resizeMode": "contain",
           "backgroundColor": "#ffffff",
-          "dark": {
-            "backgroundColor": "#000000"
-          }
+          "dark": { "backgroundColor": "#ffffff" }
         }
       ],
       "expo-font",
@@ -53,7 +49,11 @@
       "reactCompiler": true
     },
     "extra": {
-      "router": {}
-    }
+      "router": {},
+      "eas": {
+        "projectId": "7724c5f5-1a70-4af6-9120-4397c339b6cb"
+      }
+    },
+    "owner": "momentum_app"
   }
 }

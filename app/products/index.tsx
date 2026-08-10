@@ -11,11 +11,12 @@
  */
 import { useCallback, useMemo, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, useWindowDimensions, View } from 'react-native';
 import { Stack, router } from 'expo-router';
 
-import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
-import { C3S_COLORS, C3S_RADIUS, C3S_SPACING, C3S_TYPE } from '@/constants/c3s-ui';
+import { C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import { C3SDisclosure, C3SOperatorFocus } from '@/components/operator-ui';
+import { C3S_COLORS, C3S_RADIUS } from '@/constants/c3s-ui';
 import {
   PRODUCTION_SECTION_LABELS,
   PRODUCTION_SECTION_ORDER,
@@ -25,6 +26,7 @@ import {
   type ProductProfile,
   type ProductionSection,
 } from '@/lib/products';
+import { useAuth } from '@/lib/auth/context';
 
 type Filter = 'all' | ProductionSection;
 type SpeciesFilter = 'all' | ProductProfile['species'];
@@ -32,6 +34,10 @@ type ProcessFilter = 'all' | ProductProfile['processType'];
 type ActiveFilter = 'all' | 'active' | 'inactive';
 
 export default function ProductsScreen() {
+  const { profile } = useAuth();
+  const { width } = useWindowDimensions();
+  const compact = width <= 600;
+  const canEdit = Boolean(profile?.active && ['admin', 'supervisor'].includes(profile.role));
   const [profiles, setProfiles] = useState<ProductProfile[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -75,6 +81,7 @@ export default function ProductsScreen() {
   }, [profiles, filter, speciesFilter, processFilter, activeFilter, query]);
 
   function beginEdit(p: ProductProfile) {
+    if (!canEdit) return;
     setEditingId(p.id);
     setEditDraft({
       productName: p.productName,
@@ -112,9 +119,16 @@ export default function ProductsScreen() {
             </Pressable>
           }
         />
+        <C3SOperatorFocus
+          status={`${filtered.length} matching products`}
+          action={editingId ? 'Save Product Profile' : 'Review Configured Requirements'}
+          detail={canEdit ? 'Supervisors can edit. Safety limits and production rules remain visible.' : 'Product settings are read-only for your role.'}
+          tone={editingId ? 'waiting' : 'active'}
+        />
 
         {/* Filter / search bar */}
         <View style={styles.toolbar}>
+          <C3SDisclosure title="Filters">
           <View style={styles.filterRow}>
             <FilterChip label="All" active={filter === 'all'} onPress={() => setFilter('all')} />
             {PRODUCTION_SECTION_ORDER.map((s) => (
@@ -141,6 +155,7 @@ export default function ProductsScreen() {
             <FilterChip label="Active" active={activeFilter === 'active'} onPress={() => setActiveFilter('active')} />
             <FilterChip label="Inactive" active={activeFilter === 'inactive'} onPress={() => setActiveFilter('inactive')} />
           </View>
+          </C3SDisclosure>
           <TextInput
             placeholder="Search code or name…"
             placeholderTextColor={C3S_COLORS.textMuted}
@@ -167,12 +182,7 @@ export default function ProductsScreen() {
               <Text style={[styles.cellCode, styles.headerCell]}>CODE</Text>
               <Text style={[styles.cellName, styles.headerCell]}>PRODUCT</Text>
               <Text style={[styles.cellSm, styles.headerCell]}>SECTION</Text>
-              <Text style={[styles.cellSm, styles.headerCell]}>COOK</Text>
-              <Text style={[styles.cellSm, styles.headerCell]}>CHILL</Text>
-              <Text style={[styles.cellSm, styles.headerCell]}>BLAST</Text>
-              <Text style={[styles.cellXs, styles.headerCell]}>RACKS</Text>
-              <Text style={[styles.cellXs, styles.headerCell]}>SHELF</Text>
-              <Text style={[styles.cellXs, styles.headerCell]}>PROBE</Text>
+              {!compact ? <><Text style={[styles.cellSm, styles.headerCell]}>COOK</Text><Text style={[styles.cellSm, styles.headerCell]}>CHILL</Text><Text style={[styles.cellSm, styles.headerCell]}>BLAST</Text><Text style={[styles.cellXs, styles.headerCell]}>RACKS</Text><Text style={[styles.cellXs, styles.headerCell]}>SHELF</Text><Text style={[styles.cellXs, styles.headerCell]}>PROBE</Text></> : null}
             </View>
 
             {filtered.map((p) => {
@@ -217,7 +227,7 @@ export default function ProductsScreen() {
                         narrow
                       />
                     </>
-                  ) : (
+                  ) : compact ? <Text style={styles.compactRequirements}>Configured: Cook {formatHours(p.estimatedCookTimeHours)} • Chill {p.estimatedChillTimeHours > 0 ? formatHours(p.estimatedChillTimeHours) : 'NA'} • {p.rackCapacity || '—'} racks • Probe {p.probeOutTemp}°</Text> : (
                     <>
                       <Text style={styles.cellSm}>{formatHours(p.estimatedCookTimeHours)}</Text>
                       <Text style={styles.cellSm}>
@@ -298,7 +308,7 @@ const styles = StyleSheet.create({
     borderColor: C3S_COLORS.border,
     backgroundColor: C3S_COLORS.panel,
   },
-  chipActive: { backgroundColor: '#1565C0', borderColor: '#1565C0' },
+  chipActive: { backgroundColor: C3S_COLORS.accent, borderColor: C3S_COLORS.accent },
   chipText: { color: C3S_COLORS.textMuted, fontSize: 12, fontWeight: '700' },
   chipTextActive: { color: C3S_COLORS.textStrong },
   search: {
@@ -352,6 +362,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   cellInputNarrow: { width: 56 },
+  compactRequirements: { width: '100%', color: C3S_COLORS.textMuted, fontSize: 12, lineHeight: 18, fontWeight: '600' },
   editActions: { flexDirection: 'row', gap: 6, marginTop: 6, width: '100%' },
   miniBtn: {
     paddingHorizontal: 10,
@@ -361,6 +372,6 @@ const styles = StyleSheet.create({
     borderColor: C3S_COLORS.border,
     backgroundColor: C3S_COLORS.panelAlt,
   },
-  miniBtnPrimary: { backgroundColor: '#1565C0', borderColor: '#1565C0' },
+  miniBtnPrimary: { backgroundColor: C3S_COLORS.accent, borderColor: C3S_COLORS.accent },
   miniBtnText: { color: C3S_COLORS.textStrong, fontSize: 12, fontWeight: '700' },
 });

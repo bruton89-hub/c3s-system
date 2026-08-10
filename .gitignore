@@ -28,7 +28,7 @@ npm-debug.*
 yarn-debug.*
 yarn-error.*
 pnpm-debug.*
-firebase-debug.log*
+firebase-debug*.log*
 firestore-debug.log*
 
 # Environment and credentials
@@ -48,6 +48,9 @@ GoogleService-Info.plist
 # TypeScript / test output
 *.tsbuildinfo
 coverage/
+.firebase-config/
+.firebase-data/
+dist-*/
 
 # Local editor and OS files
 .DS_Store

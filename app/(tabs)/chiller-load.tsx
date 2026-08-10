@@ -4,20 +4,19 @@ import { useFocusEffect } from '@react-navigation/native';
 import { router } from 'expo-router';
 
 import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import { C3SDisclosure, C3SOperatorFocus } from '@/components/operator-ui';
+import { C3S_COLORS } from '@/constants/c3s-ui';
 import {
-  assignChillLogToChiller,
-  finishChillLog,
-  flagChillLogDeviation,
   getChillers,
   getChillLogs,
   getPrepQueueItems,
   getQAChecks,
-  recordChillCheck,
   type ChillerItem,
   type ChillLogItem,
   type PrepQueueItem,
   type QACheckItem,
 } from '@/lib/firebase/repository';
+import { getOperationalItems, oItemAssignChiller, oItemFinishChill, oItemRecordChillCheck, placeOperationalItemOnHold, type OItemItem } from '@/lib/operational-items';
 
 function toOperatorMessage(error: unknown, fallback: string) {
   if (!(error instanceof Error) || !error.message) return fallback;
@@ -55,6 +54,7 @@ export default function ChillerLoadScreen() {
   const [chillLogs, setChillLogs] = useState<ChillLogItem[]>([]);
   const [chillers, setChillers] = useState<ChillerItem[]>([]);
   const [qaChecks, setQaChecks] = useState<QACheckItem[]>([]);
+  const [operationalItems, setOperationalItems] = useState<OItemItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
@@ -69,16 +69,18 @@ export default function ChillerLoadScreen() {
     try {
       setIsLoading(true);
       setLoadError(null);
-      const [p, c, ch, q] = await Promise.all([
+      const [p, c, ch, q, items] = await Promise.all([
         getPrepQueueItems(),
         getChillLogs(),
         getChillers(),
         getQAChecks(),
+        getOperationalItems(),
       ]);
       setPreps(p);
       setChillLogs(c);
       setChillers(ch);
       setQaChecks(q);
+      setOperationalItems(items);
     } catch (e) {
       setLoadError(toOperatorMessage(e, 'Failed to load chill data.'));
     } finally {
@@ -130,7 +132,9 @@ export default function ChillerLoadScreen() {
         })
         .reduce((sum, log) => sum + (log.racks ?? 0), 0);
       const cap = chillerCapacity(name);
-      return { name, item, load, cap, overload: load > cap };
+      const unavailable = item?.status === 'cleaning' || !['idle', 'chilling'].includes(item?.status ?? '');
+      const state = item?.status === 'cleaning' ? 'Cleaning' : unavailable ? 'Unavailable' : load >= cap ? 'Full' : load > 0 ? 'Partially Loaded' : 'Available';
+      return { name, item, load, cap, overload: load > cap, state, spaces: Math.max(0, cap - load) };
     });
   }, [chillers, running]);
 
@@ -142,7 +146,9 @@ export default function ChillerLoadScreen() {
     }
     try {
       setWorkingId(log.id);
-      await assignChillLogToChiller(log.id, chillerId);
+      const item = operationalItems.find((entry) => entry.chillLogId === log.id);
+      if (!item) throw new Error('Canonical production item was not found. Refresh and try again.');
+      await oItemAssignChiller(item.id, item.stage, item.status, log.id, chillerId);
       setActionMsg(`Assigned ${prepNameFrom(log, prepById[log.prepId])} to selected chiller.`);
       await load();
     } catch (e) {
@@ -162,7 +168,9 @@ export default function ChillerLoadScreen() {
     }
     try {
       setWorkingId(log.id);
-      await recordChillCheck(log.id, type === '50' ? { timeTo50F: value } : { timeTo40F: value });
+      const item = operationalItems.find((entry) => entry.chillLogId === log.id);
+      if (!item) throw new Error('Canonical production item was not found. Refresh and try again.');
+      await oItemRecordChillCheck(item.id, log.id, type === '50' ? { timeTo50F: value } : { timeTo40F: value });
       setActionMsg(`Recorded ${type}°F chill check for ${prepNameFrom(log, prepById[log.prepId])}.`);
       await load();
     } catch (e) {
@@ -181,7 +189,9 @@ export default function ChillerLoadScreen() {
     }
     try {
       setWorkingId(log.id);
-      await finishChillLog(log.id, {
+      const item = operationalItems.find((entry) => entry.chillLogId === log.id);
+      if (!item) throw new Error('Canonical production item was not found. Refresh and try again.');
+      await oItemFinishChill(item.id, item.stage, item.status, log.id, {
         signedOutTemp: temp,
         timeTo50F: log.timeTo50F ?? undefined,
         timeTo40F: log.timeTo40F ?? undefined,
@@ -198,7 +208,9 @@ export default function ChillerLoadScreen() {
   async function onFlagDeviation(log: ChillLogItem) {
     try {
       setWorkingId(log.id);
-      await flagChillLogDeviation(log.id, 'Marked from Chiller Load hold/deviation review.');
+      const item = operationalItems.find((entry) => entry.chillLogId === log.id);
+      if (!item) throw new Error('Canonical production item was not found. Refresh and try again.');
+      await placeOperationalItemOnHold({ itemId: item.id, reasonKey: 'process_deviation', reasonLabel: 'Process Deviation', notes: 'Marked from Chiller Load hold/deviation review.', actorName: 'Chill operator' });
       setActionMsg(`Flagged deviation for ${prepNameFrom(log, prepById[log.prepId])}.`);
       await load();
     } catch (e) {
@@ -216,6 +228,12 @@ export default function ChillerLoadScreen() {
           subtitle={`Awaiting Chiller Assignment: ${awaitingAssignment.length}`}
           right={<Pressable style={styles.refreshBtn} onPress={load}><Text style={styles.refreshText}>Refresh</Text></Pressable>}
         />
+        <C3SOperatorFocus
+          status={`${awaitingAssignment.length} waiting • ${running.length} chilling`}
+          action={holdDeviation.length > 0 ? 'Resolve Hold' : checkDue.length > 0 ? 'Record Check' : awaitingAssignment.length > 0 ? 'Start Chill' : readyForQa.length > 0 ? 'Send to QA' : 'No Action Required'}
+          detail="Capacity and available equipment are shown before assignment."
+          tone={holdDeviation.length > 0 ? 'critical' : awaitingAssignment.length + running.length > 0 ? 'active' : 'complete'}
+        />
 
         <ScrollView contentContainerStyle={styles.content}>
           {isLoading ? <Text style={styles.info}>Loading chill execution data...</Text> : null}
@@ -228,7 +246,8 @@ export default function ChillerLoadScreen() {
               <View key={c.name} style={[styles.stripCard, c.overload && styles.stripOverload]}>
                 <Text style={styles.stripName}>{c.name.replace('Chiller ', 'CH-')}</Text>
                 <Text style={styles.stripValue}>{c.load}/{c.cap} racks</Text>
-                <Text style={styles.stripState}>{c.overload ? 'OVERLOAD' : c.item?.status || 'idle'}</Text>
+                <Text style={styles.stripState}>{c.overload ? 'OVERLOAD' : c.state}</Text>
+                <Text style={styles.stripState}>{c.spaces} spaces available</Text>
               </View>
             ))}
           </ScrollView>
@@ -238,7 +257,7 @@ export default function ChillerLoadScreen() {
           {awaitingAssignment.map((log) => {
             const prep = prepById[log.prepId] ?? null;
             return (
-              <C3SCard key={log.id} borderColor="#42A5F5">
+              <C3SCard key={log.id} borderColor={C3S_COLORS.accent}>
                 <Text style={styles.itemTitle}>{prepNameFrom(log, prep)}</Text>
                 <Meta label="Racks / Cases" value={`${log.racks ?? prep?.racks ?? '—'} / ${prep?.cases ?? '—'}`} />
                 <Meta label="Source Smokehouse" value={prep?.assignedSmokehouse ?? '—'} />
@@ -256,7 +275,7 @@ export default function ChillerLoadScreen() {
                     })}
                   </ScrollView>
                   <Pressable style={styles.primaryBtn} disabled={workingId === log.id} onPress={() => onAssign(log)}>
-                    <Text style={styles.primaryBtnText}>{workingId === log.id ? 'Assigning...' : 'Assign Chiller'}</Text>
+                    <Text style={styles.primaryBtnText}>{workingId === log.id ? 'Starting...' : 'Start Chill'}</Text>
                   </Pressable>
                 </View>
               </C3SCard>
@@ -274,7 +293,7 @@ export default function ChillerLoadScreen() {
               : '—';
             const nextCheck = log.timeTo50F == null ? 'Record 50°F milestone' : log.timeTo40F == null ? 'Record 40°F milestone' : 'Checks complete';
             return (
-              <C3SCard key={log.id} borderColor="#29B6F6">
+              <C3SCard key={log.id} borderColor={C3S_COLORS.accent}>
                 <Text style={styles.itemTitle}>{prepNameFrom(log, prep)}</Text>
                 <Meta label="Assigned Chiller" value={assignedChiller || '—'} />
                 <Meta label="Chill Start" value={fmtTs(startMs)} />
@@ -287,7 +306,7 @@ export default function ChillerLoadScreen() {
                     value={signoutTempByLogId[log.id] ?? ''}
                     onChangeText={(v) => setSignoutTempByLogId((m) => ({ ...m, [log.id]: v }))}
                     placeholder="Sign-out temp °F"
-                    placeholderTextColor="#6E7681"
+                    placeholderTextColor={C3S_COLORS.textMuted}
                     keyboardType="numeric"
                   />
                   <Pressable style={styles.primaryBtn} disabled={workingId === log.id} onPress={() => onSendToQa(log)}>
@@ -305,7 +324,7 @@ export default function ChillerLoadScreen() {
             const defaultType: '50' | '40' = log.timeTo50F == null ? '50' : '40';
             const selectedType = checkTypeByLogId[log.id] ?? defaultType;
             return (
-              <C3SCard key={`due-${log.id}`} borderColor="#FFA726">
+              <C3SCard key={`due-${log.id}`} borderColor={C3S_COLORS.warning}>
                 <Text style={styles.itemTitle}>{prepNameFrom(log, prep)}</Text>
                 <Meta label="Target/Check" value={selectedType === '50' ? '50°F milestone' : '40°F milestone'} />
                 <View style={styles.rowAction}>
@@ -320,34 +339,35 @@ export default function ChillerLoadScreen() {
                     value={checkMinutesByLogId[log.id] ?? ''}
                     onChangeText={(v) => setCheckMinutesByLogId((m) => ({ ...m, [log.id]: v }))}
                     placeholder="Minutes"
-                    placeholderTextColor="#6E7681"
+                    placeholderTextColor={C3S_COLORS.textMuted}
                     keyboardType="numeric"
                   />
                   <Pressable style={styles.primaryBtn} disabled={workingId === log.id} onPress={() => onRecordCheck(log)}>
-                    <Text style={styles.primaryBtnText}>{workingId === log.id ? 'Saving...' : 'Record Chill Check'}</Text>
+                    <Text style={styles.primaryBtnText}>{workingId === log.id ? 'Saving...' : 'Record Check'}</Text>
                   </Pressable>
                 </View>
               </C3SCard>
             );
           })}
 
-          <Text style={styles.sectionTitle}>Ready for QA</Text>
+          <C3SDisclosure title="Ready for QA" count={readyForQa.length}>
           {readyForQa.length === 0 ? <Empty text="No products waiting for QA." /> : null}
           {readyForQa.map((q) => (
-            <C3SCard key={q.id} borderColor="#66BB6A">
+            <C3SCard key={q.id} borderColor={C3S_COLORS.success}>
               <Text style={styles.itemTitle}>{q.productName || q.prepId || '—'}</Text>
               <Meta label="Status" value="Ready for QA" />
               <Meta label="Timestamp" value={fmtTs(q.timestamp?.toMillis?.())} />
               <Pressable style={styles.secondaryBtn} onPress={() => router.push('/qa-review')}>
-                <Text style={styles.secondaryBtnText}>Go to QA / Mark Ready for QA</Text>
+                <Text style={styles.secondaryBtnText}>Send to QA</Text>
               </Pressable>
             </C3SCard>
           ))}
+          </C3SDisclosure>
 
           <Text style={styles.sectionTitle}>Hold / Deviation</Text>
           {holdDeviation.length === 0 ? <Empty text="No chill hold/deviation items." /> : null}
           {holdDeviation.map((log) => (
-            <C3SCard key={`hold-${log.id}`} borderColor="#EF5350">
+            <C3SCard key={`hold-${log.id}`} borderColor={C3S_COLORS.danger}>
               <Text style={styles.itemTitle}>{log.productName || log.prepId || '—'}</Text>
               <Meta label="Reason" value={log.deviationReason || log.deviationNotes || '—'} />
               <Meta label="Timestamp" value={fmtTs(log.deviationAt?.toMillis?.())} />
@@ -383,84 +403,85 @@ const styles = StyleSheet.create({
   content: { gap: 8, paddingBottom: 24 },
   refreshBtn: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
-  refreshText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
-  sectionTitle: { color: '#8AB4F8', fontSize: 13, fontWeight: '800', marginTop: 4 },
+  refreshText: { color: C3S_COLORS.textPrimary, fontSize: 13, fontWeight: '800' },
+  sectionTitle: { color: C3S_COLORS.textStrong, fontSize: 19, fontWeight: '900', marginTop: 8 },
   stripRow: { gap: 6 },
   stripCard: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 6,
     minWidth: 90,
   },
-  stripOverload: { borderColor: '#C62828', backgroundColor: '#2A1414' },
-  stripName: { color: '#E6EDF3', fontSize: 11, fontWeight: '800' },
-  stripValue: { color: '#AAB4BE', fontSize: 11 },
-  stripState: { color: '#8B949E', fontSize: 10 },
-  itemTitle: { color: '#E6EDF3', fontSize: 13, fontWeight: '800', marginBottom: 4 },
+  stripOverload: { borderColor: C3S_COLORS.danger, backgroundColor: C3S_COLORS.dangerSoft },
+  stripName: { color: C3S_COLORS.textStrong, fontSize: 11, fontWeight: '800' },
+  stripValue: { color: C3S_COLORS.textMuted, fontSize: 11 },
+  stripState: { color: C3S_COLORS.textMuted, fontSize: 10 },
+  itemTitle: { color: C3S_COLORS.textStrong, fontSize: 18, fontWeight: '900', marginBottom: 7 },
   metaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8, marginBottom: 2 },
-  metaLabel: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
-  metaValue: { color: '#C9D1D9', fontSize: 11, fontWeight: '600' },
+  metaLabel: { color: C3S_COLORS.textMuted, fontSize: 13, fontWeight: '700' },
+  metaValue: { color: C3S_COLORS.textPrimary, fontSize: 14, fontWeight: '700' },
   rowAction: { flexDirection: 'row', gap: 6, alignItems: 'center', marginTop: 6, flexWrap: 'wrap' },
   chips: { gap: 4 },
   chip: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#0D1117',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panelAlt,
     borderRadius: 999,
     paddingHorizontal: 8,
     paddingVertical: 5,
   },
-  chipActive: { borderColor: '#2F6D8A', backgroundColor: '#13314A' },
-  chipText: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
-  chipTextActive: { color: '#CDE8FF' },
+  chipActive: { borderColor: C3S_COLORS.accent, backgroundColor: C3S_COLORS.accentSoft },
+  chipText: { color: C3S_COLORS.textMuted, fontSize: 11, fontWeight: '700' },
+  chipTextActive: { color: C3S_COLORS.textPrimary },
   input: {
     minWidth: 90,
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#0D1117',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 6,
-    color: '#E6EDF3',
-    fontSize: 12,
+    color: C3S_COLORS.textPrimary,
+    fontSize: 14,
   },
   primaryBtn: {
     borderWidth: 1,
-    borderColor: '#2F6D8A',
-    backgroundColor: '#13314A',
-    borderRadius: 8,
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.accent,
+    borderRadius: 11,
+    minHeight: 48,
     paddingHorizontal: 10,
     paddingVertical: 7,
   },
-  primaryBtnText: { color: '#E6EDF3', fontSize: 11, fontWeight: '700' },
+  primaryBtnText: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
   secondaryBtn: {
     marginTop: 6,
     borderWidth: 1,
-    borderColor: '#455A64',
-    backgroundColor: '#1A2430',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panelAlt,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 7,
     alignSelf: 'flex-start',
   },
-  secondaryBtnText: { color: '#C9D1D9', fontSize: 11, fontWeight: '700' },
+  secondaryBtnText: { color: C3S_COLORS.textPrimary, fontSize: 11, fontWeight: '700' },
   emptyCard: {
     borderWidth: 1,
-    borderColor: '#30363D',
+    borderColor: C3S_COLORS.border,
     borderRadius: 8,
-    backgroundColor: '#151A21',
+    backgroundColor: C3S_COLORS.panel,
     padding: 10,
   },
-  emptyText: { color: '#8B949E', fontSize: 12 },
-  info: { color: '#8B949E', fontSize: 12 },
-  error: { color: '#FF7B72', fontSize: 12, fontWeight: '700' },
+  emptyText: { color: C3S_COLORS.textMuted, fontSize: 12 },
+  info: { color: C3S_COLORS.textMuted, fontSize: 12 },
+  error: { color: C3S_COLORS.danger, fontSize: 12, fontWeight: '700' },
 });

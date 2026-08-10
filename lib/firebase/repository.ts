@@ -9,6 +9,7 @@ import {
   orderBy,
   QueryDocumentSnapshot,
   query,
+  serverTimestamp,
   setDoc,
   Timestamp,
   updateDoc,
@@ -34,6 +35,7 @@ import {
   WeeklyPlanDoc,
 } from '@/lib/firebase/models';
 import { recordOperationalEvent } from '@/lib/operational-events';
+import { getActiveStressScenario } from '@/lib/stress/scenarios';
 
 /** Input required to record a thermal step deviation.
  *  Deviations allow an out-of-range step to proceed with supervisor approval. */
@@ -201,7 +203,7 @@ export async function getWeeklyPlanItems(): Promise<WeeklyPlanItem[]> {
 export async function createWeeklyPlanItem(input: Omit<WeeklyPlanDoc, 'createdAt'> & { createdAt?: import('firebase/firestore').Timestamp }): Promise<string> {
   const payload: WeeklyPlanDoc = {
     ...input,
-    createdAt: input.createdAt ?? Timestamp.now(),
+    createdAt: serverTimestamp() as unknown as Timestamp,
   };
   const ref = await addDoc(collectionRef('weekly_plan'), sanitizeForWrite(payload));
   return ref.id;
@@ -354,6 +356,7 @@ export async function readPrepQueue() {
 }
 
 export async function getPrepQueueItems(): Promise<PrepQueueItem[]> {
+  if (getActiveStressScenario()) return [];
   return readPrepQueue();
 }
 
@@ -710,7 +713,7 @@ export async function finishCookForPrep(prepId: string, extras?: { assignedBlast
     timeTo50F: null,
     timeTo40F: null,
     status: 'waiting' as const,
-    createdAt: Timestamp.now(),
+    createdAt: serverTimestamp(),
     cookType: prepItem.cookType,
     targetTemp: prepItem.targetTemp,
     expectedCookMinutes: prepItem.expectedCookMinutes,
@@ -746,6 +749,8 @@ export async function createSmokehouse(id: string, input: SmokehouseDoc) {
 }
 
 export async function getSmokehouses(): Promise<SmokehouseItem[]> {
+  const stress = getActiveStressScenario();
+  if (stress) return stress.equipment.filter((entry) => entry.kind === 'Oven').map((entry) => ({ id: entry.id, name: entry.id, setupType: 'compression', status: entry.status === 'Cleaning' ? 'cleaning' : entry.status === 'In Use' || entry.status === 'Unavailable' ? 'cooking' : 'idle', currentLoadId: entry.assignedItemId ?? null, lastCleanedAt: null }));
   const snapshot = await getDocs(query(collectionRef('smokehouses'), orderBy('name', 'asc')));
   return snapshot.docs.map((item: QueryDocumentSnapshot<SmokehouseDoc>) => ({
     id: item.id,
@@ -759,6 +764,8 @@ export async function createChiller(id: string, input: ChillerDoc) {
 }
 
 export async function getChillers(): Promise<ChillerItem[]> {
+  const stress = getActiveStressScenario();
+  if (stress) return stress.equipment.filter((entry) => entry.kind === 'Chiller').map((entry) => ({ id: entry.id, name: entry.id, status: entry.status === 'Cleaning' ? 'cleaning' : entry.status === 'In Use' || entry.status === 'Unavailable' ? 'chilling' : 'idle', currentLoadId: entry.assignedItemId ?? null }));
   const snapshot = await getDocs(query(collectionRef('chillers'), orderBy('name', 'asc')));
   return snapshot.docs.map((item: QueryDocumentSnapshot<ChillerDoc>) => ({
     id: item.id,
@@ -797,11 +804,21 @@ export async function createCookLog(input: CookLogDoc) {
 }
 
 export async function createChillLog(input: ChillLogDoc) {
-  const ref = await addDoc(collectionRef('chill_logs'), sanitizeForWrite(input));
+  const ref = await addDoc(collectionRef('chill_logs'), sanitizeForWrite({ ...input, createdAt: serverTimestamp() } as unknown as ChillLogDoc));
   return ref.id;
 }
 
 export async function getChillLogs(): Promise<ChillLogItem[]> {
+  const stress = getActiveStressScenario();
+  if (stress) return stress.items.filter((item) => item.stage === 'chill').map((item) => ({
+    id: item.chillLogId!, chillerId: item.chillerId ?? null, productName: item.productNameSnapshot ?? item.productName,
+    prepId: item.id, timeTo50F: item.timeTo50F ?? null, timeTo40F: item.timeTo40F ?? null,
+    status: item.status === 'in_chill' ? 'running' : item.status === 'chill_complete' ? 'complete' : 'waiting',
+    createdAt: item.updatedAt, cookType: item.cookType, targetTemp: item.targetTemp,
+    expectedCookMinutes: item.expectedCookMinutes, rackType: item.rackType, species: item.species,
+    packagingType: item.packagingType, thermalOwner: item.thermalOwner, makeDate: item.makeDate,
+    deliveryDate: item.deliveryDate, racks: item.racks, pieces: item.pieces,
+  }));
   const snapshot = await getDocs(query(collectionRef('chill_logs'), orderBy('createdAt', 'desc')));
   return snapshot.docs.map((item: QueryDocumentSnapshot<ChillLogDoc>) => ({
     id: item.id,
@@ -866,6 +883,15 @@ export async function assignChillLogToChiller(chillLogId: string, chillerId: str
 }
 
 export async function getQAChecks(): Promise<QACheckItem[]> {
+  const stress = getActiveStressScenario();
+  if (stress) return stress.items.filter((item) => item.stage === 'qa').map((item) => ({
+    id: item.qaCheckId!, prepId: item.id, productName: item.productNameSnapshot ?? item.productName,
+    type: 'chill', status: item.status === 'hold' ? 'qa_hold' : 'ready_for_qa', notes: item.activeHold?.notes ?? '',
+    reviewedBy: item.activeHold?.placedByName ?? null, timestamp: item.updatedAt, cookType: item.cookType,
+    targetTemp: item.targetTemp, expectedCookMinutes: item.expectedCookMinutes, rackType: item.rackType,
+    species: item.species, packagingType: item.packagingType, thermalOwner: item.thermalOwner,
+    makeDate: item.makeDate, deliveryDate: item.deliveryDate, racks: item.racks, pieces: item.pieces,
+  }));
   const snapshot = await getDocs(query(collectionRef('qa_checks'), orderBy('timestamp', 'desc')));
   return snapshot.docs.map((item: QueryDocumentSnapshot<QACheckDoc>) => ({
     id: item.id,
@@ -914,7 +940,7 @@ export async function updateQACheckReview(
           : 'qa_review_required',
     decision,
     reviewedBy,
-    reviewedAt: Timestamp.now(),
+    reviewedAt: serverTimestamp() as unknown as Timestamp,
   };
   if (notes) {
     updatePayload.notes = notes;
@@ -1002,7 +1028,7 @@ export async function finishChillLog(
   // Build prep_queue sign-out updates.
   const prepSignOutUpdates: Record<string, unknown> = {};
   if (extras?.signedOutTemp !== undefined) {
-    prepSignOutUpdates.signedOutAt = Timestamp.now();
+    prepSignOutUpdates.signedOutAt = serverTimestamp();
     prepSignOutUpdates.signedOutTemp = extras.signedOutTemp;
   }
   if (extras?.coolerId !== undefined) {
@@ -1060,7 +1086,7 @@ export async function finishChillLog(
     status: 'ready_for_qa',
     notes: '',
     reviewedBy: null,
-    timestamp: Timestamp.now(),
+    timestamp: serverTimestamp(),
     cookType: chillLog.cookType,
     targetTemp: chillLog.targetTemp,
     expectedCookMinutes: chillLog.expectedCookMinutes,
@@ -1108,6 +1134,7 @@ export async function recordChillCheck(
 }
 
 export async function getPackagingLogs(): Promise<PackagingLogItem[]> {
+  if (getActiveStressScenario()) return [];
   const snapshot = await getDocs(query(collectionRef('packaging_logs'), orderBy('startedAt', 'desc')));
   return snapshot.docs.map((item: QueryDocumentSnapshot<PackagingLogDoc>) => ({
     id: item.id,
@@ -1162,7 +1189,7 @@ export async function startPackagingForQACheck(qaCheckId: string) {
     packagingLine: null,
     packagedBy: null,
     status: 'running',
-    startedAt: Timestamp.now(),
+    startedAt: serverTimestamp(),
     completedAt: null,
     notes: '',
     hasDeviation: qaCheck.hasDeviation ?? false,
@@ -1216,7 +1243,7 @@ export async function completePackagingLog(
 
   await updateDoc(docRef('packaging_logs', packagingLogId), removeUndefinedFields({
     status: 'complete',
-    completedAt: Timestamp.now(),
+    completedAt: serverTimestamp(),
     casesProduced: input.casesProduced,
     unitsProduced: input.unitsProduced,
     yieldPercent: input.yieldPercent,
@@ -1720,7 +1747,7 @@ export async function evacuateAndFinishCookForPrep(
     timeTo50F: null,
     timeTo40F: null,
     status: 'waiting' as const,
-    createdAt: Timestamp.now(),
+    createdAt: serverTimestamp(),
     cookType: prepItem.cookType,
     targetTemp: prepItem.targetTemp,
     expectedCookMinutes: prepItem.expectedCookMinutes,
@@ -1805,7 +1832,7 @@ export async function resolveChillLogDeviation(chillLogId: string, note: string)
 export async function createQACheck(input: NewQACheckInput) {
   const payload: QACheckDoc = removeUndefinedFields({
     ...input,
-    timestamp: input.timestamp ?? Timestamp.now(),
+    timestamp: serverTimestamp(),
   } as QACheckDoc);
 
   const ref = await addDoc(collectionRef('qa_checks'), sanitizeWithSafePrimitives(payload));

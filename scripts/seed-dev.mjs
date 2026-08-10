@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
-import { initializeApp } from 'firebase/app';
-import { collection, doc, getDocs, getFirestore, limit, query, setDoc, Timestamp } from 'firebase/firestore';
+import { initializeApp } from 'firebase-admin/app';
+import { getFirestore, Timestamp } from 'firebase-admin/firestore';
 
 dotenv.config({ path: new URL('../.env', import.meta.url).pathname, quiet: true });
 
@@ -12,17 +12,20 @@ function envValue(expoPublicKey, fallbackKey) {
   return value;
 }
 
-const firebaseConfig = {
-  apiKey: envValue('EXPO_PUBLIC_FIREBASE_API_KEY', 'FIREBASE_API_KEY'),
-  authDomain: envValue('EXPO_PUBLIC_FIREBASE_AUTH_DOMAIN', 'FIREBASE_AUTH_DOMAIN'),
-  projectId: envValue('EXPO_PUBLIC_FIREBASE_PROJECT_ID', 'FIREBASE_PROJECT_ID'),
-  storageBucket: envValue('EXPO_PUBLIC_FIREBASE_STORAGE_BUCKET', 'FIREBASE_STORAGE_BUCKET'),
-  messagingSenderId: envValue('EXPO_PUBLIC_FIREBASE_MESSAGING_SENDER_ID', 'FIREBASE_MESSAGING_SENDER_ID'),
-  appId: envValue('EXPO_PUBLIC_FIREBASE_APP_ID', 'FIREBASE_APP_ID'),
-};
+const projectId = envValue('EXPO_PUBLIC_FIREBASE_PROJECT_ID', 'FIREBASE_PROJECT_ID');
+const emulatorHost = (process.env.FIRESTORE_EMULATOR_HOST ?? '').trim();
+if (!emulatorHost || !projectId.startsWith('demo-')) {
+  throw new Error('Development seeding is allowed only against a local emulator with a demo- project ID.');
+}
 
-const app = initializeApp(firebaseConfig);
+const app = initializeApp({ projectId });
 const db = getFirestore(app);
+const doc = (firestore, collectionName, id) => firestore.collection(collectionName).doc(id);
+const collection = (firestore, collectionName) => firestore.collection(collectionName);
+const setDoc = (reference, data) => reference.set(data);
+const limit = (count) => count;
+const query = (reference, count) => reference.limit(count);
+const getDocs = (reference) => reference.get();
 
 async function seed() {
   const now = Timestamp.now();
@@ -641,6 +644,43 @@ async function seed() {
     notes: 'Pilot-ready completed lot.',
   });
 
+  const operationalBase = {
+    productId: 'product-dev-sausage',
+    productName: 'Smoked Sausage with Extra Long Product Name for Floor Device QA',
+    productCode: 'SSG-001',
+    racks: 10,
+    pieces: 360,
+    deliveryDate: '2026-08-12',
+    makeDate: '2026-08-10',
+    cookType: 'smoke',
+    targetTemp: 155,
+    expectedCookMinutes: 95,
+    expectedChillMinutes: 70,
+    expectedPackMinutes: 45,
+    rackType: 'Sausage Stick Rack',
+    species: 'Pork',
+    packagingType: 'Vacuum Pack',
+    thermalOwner: 'Thermal Team A',
+    criticalLimit: 'Configured process requirements apply',
+    transitions: [],
+    createdAt: Timestamp.fromMillis(Date.now() - 4 * 60 * 60 * 1000),
+  };
+  const operationalItems = [
+    { id: 'batch-2840', poNumber: '2840', productName: 'Honey Baked Ham', stage: 'rtc', status: 'staging', prepQueueId: 'prep-dev-1', updatedAt: Timestamp.fromMillis(Date.now() - 50 * 60 * 1000) },
+    { id: 'batch-2841', poNumber: '2841', stage: 'thermal', status: 'cooking', prepQueueId: 'prep-dev-4', assignedSmokehouse: 'Smokehouse D', cookStartedAt: Timestamp.fromMillis(Date.now() - 108 * 60 * 1000), updatedAt: Timestamp.fromMillis(Date.now() - 108 * 60 * 1000), hasDeviation: true, deviationNotes: 'Required temperature check overdue' },
+    { id: 'batch-2842', poNumber: '2842', productName: 'Turkey Breast', stage: 'thermal', status: 'assigned', prepQueueId: 'prep-dev-3', assignedSmokehouse: 'Smokehouse E', updatedAt: Timestamp.fromMillis(Date.now() - 18 * 60 * 1000) },
+    { id: 'batch-2843', poNumber: '2843', productName: 'Honey Baked Ham', stage: 'chill', status: 'awaiting_chill', prepQueueId: 'prep-dev-5', updatedAt: Timestamp.fromMillis(Date.now() - 42 * 60 * 1000) },
+    { id: 'batch-2844', poNumber: '2844', productName: 'Turkey Breast', stage: 'chill', status: 'in_chill', prepQueueId: 'prep-dev-6', chillLogId: 'chill-dev-1', assignedChiller: 'Chiller 10', updatedAt: Timestamp.fromMillis(Date.now() - 31 * 60 * 1000) },
+    { id: 'batch-2845', poNumber: '2845', productName: 'Smoked Sausage', stage: 'qa', status: 'ready_for_qa', prepQueueId: 'prep-dev-7', qaCheckId: 'qa-dev-1', updatedAt: Timestamp.fromMillis(Date.now() - 27 * 60 * 1000) },
+    { id: 'batch-2846', poNumber: '2846', productName: 'Honey Baked Ham', stage: 'qa', status: 'hold', prepQueueId: 'prep-dev-8', updatedAt: Timestamp.fromMillis(Date.now() - 73 * 60 * 1000), activeHold: { reasonKey: 'qa_review', reasonLabel: 'QA Review', placedBy: 'qa-dev-1', placedByName: 'QA Lead', placedAt: Timestamp.fromMillis(Date.now() - 73 * 60 * 1000), preHoldStage: 'qa', preHoldStatus: 'ready_for_qa' } },
+    { id: 'batch-2847', poNumber: '2847', productName: 'Turkey Breast', stage: 'packaging', status: 'packaging_in_progress', prepQueueId: 'prep-dev-9', packagingLogId: 'packaging-dev-1', updatedAt: Timestamp.fromMillis(Date.now() - 22 * 60 * 1000) },
+    { id: 'batch-2839', poNumber: '2839', productName: 'Honey Baked Ham', stage: 'complete', status: 'complete', prepQueueId: 'prep-dev-10', packagingLogId: 'packaging-dev-2', updatedAt: Timestamp.fromMillis(Date.now() - 12 * 60 * 1000) },
+  ];
+  for (const item of operationalItems) {
+    const { id, ...data } = item;
+    await setDoc(doc(db, 'operational_items', id), { ...operationalBase, ...data });
+  }
+
   const checks = await Promise.all([
     getDocs(query(collection(db, 'products'), limit(1))),
     getDocs(query(collection(db, 'prep_queue'), limit(1))),
@@ -648,10 +688,11 @@ async function seed() {
     getDocs(query(collection(db, 'chill_logs'), limit(1))),
     getDocs(query(collection(db, 'qa_checks'), limit(1))),
     getDocs(query(collection(db, 'packaging_logs'), limit(1))),
+    getDocs(query(collection(db, 'operational_items'), limit(1))),
   ]);
 
   console.log(
-    `Seed complete. products:${checks[0].size} prep_queue:${checks[1].size} smokehouses:${checks[2].size} chill_logs:${checks[3].size} qa_checks:${checks[4].size} packaging_logs:${checks[5].size}`,
+    `Seed complete. products:${checks[0].size} prep_queue:${checks[1].size} smokehouses:${checks[2].size} chill_logs:${checks[3].size} qa_checks:${checks[4].size} packaging_logs:${checks[5].size} operational_items:${checks[6].size}`,
   );
 }
 

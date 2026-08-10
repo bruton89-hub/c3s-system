@@ -1,0 +1,27 @@
+import { useCallback, useMemo, useState } from 'react';
+import { RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+import { C3SBackHeader } from '@/components/c3s-brand';
+import { ProductionItemCard } from '@/components/production-item-card';
+import { C3SPage, C3SScreen } from '@/components/c3s-ui';
+import { C3S_COLORS } from '@/constants/c3s-ui';
+import { getOperationalItems, type OItemItem } from '@/lib/operational-items';
+import { atRiskItems, recentlyCompleted, shiftSummary } from '@/lib/operations/summary';
+import { isHeldStatus } from '@/lib/holds/core';
+import { getEquipmentOverview } from '@/lib/operations/equipment';
+import type { EquipmentSummary } from '@/lib/operations/summary';
+import { StressScenarioBanner } from '@/components/stress-scenario-banner';
+import { getActiveStressScenario } from '@/lib/stress/scenarios';
+
+export default function ShiftHandoffScreen() {
+  const [items, setItems] = useState<OItemItem[]>([]); const [loading, setLoading] = useState(true);
+  const [equipment, setEquipment] = useState<EquipmentSummary[]>([]);
+  const load = useCallback(async () => { setLoading(true); try { const next = await getOperationalItems(); setItems(next); setEquipment(await getEquipmentOverview(next)); } finally { setLoading(false); } }, []);
+  useFocusEffect(useCallback(() => { void load(); }, [load]));
+  const summary = useMemo(() => shiftSummary(items), [items]); const held = useMemo(() => items.filter((item) => isHeldStatus(item.status)), [items]); const risk = useMemo(() => atRiskItems(items, 5), [items]); const completed = useMemo(() => recentlyCompleted(items, 4), [items]);
+  const unavailable = equipment.filter((entry) => entry.status === 'Unavailable' || entry.status === 'Cleaning'); const acknowledged = getActiveStressScenario()?.simulatedAcknowledgedAlertIds.length ?? 0;
+  return <C3SScreen><C3SPage><ScrollView refreshControl={<RefreshControl refreshing={loading} onRefresh={load} tintColor={C3S_COLORS.accent} />} contentContainerStyle={styles.content}><C3SBackHeader title="Shift Handoff" subtitle="A live summary generated from C3S records" /><StressScenarioBanner /><View style={styles.metrics}><Metric value={summary.active} label="Active" /><Metric value={summary.waiting} label="Waiting" /><Metric value={summary.held} label="Held" /><Metric value={summary.critical} label="Critical" /><Metric value={acknowledged} label="Acknowledged" /><Metric value={unavailable.length} label="Equipment Issues" /></View><Section title="Approaching Important Actions" empty="All active batches are on track." items={risk} /><Section title="Held Batches" empty="No batches are on hold." items={held} /><Text style={styles.section}>Equipment Issues</Text><View style={styles.note}>{unavailable.map((entry) => <Text key={`${entry.kind}-${entry.id}`} style={styles.noteText}>{entry.kind} {entry.id} • {entry.status}{entry.assignedBatch ? ` • Batch ${entry.assignedBatch}` : ''}</Text>)}{!unavailable.length ? <Text style={styles.noteText}>No unavailable or cleaning equipment.</Text> : null}</View><Section title="Recently Completed" empty="No recently completed work." items={completed} /><View style={styles.note}><Text style={styles.noteTitle}>Handoff notes</Text><Text style={styles.noteText}>Append-only, actor-bound handoff note persistence is implemented in development code and remains feature-gated until its rules are deployed.</Text></View></ScrollView></C3SPage></C3SScreen>;
+}
+function Section({ title, empty, items }: { title: string; empty: string; items: OItemItem[] }) { return <><Text style={styles.section}>{title}</Text>{items.map((item) => <ProductionItemCard key={`${title}-${item.id}`} item={item} compact />)}{!items.length ? <Text style={styles.empty}>{empty}</Text> : null}</>; }
+function Metric({ value, label }: { value: number; label: string }) { return <View style={styles.metric}><Text style={styles.metricValue}>{value}</Text><Text style={styles.metricLabel}>{label}</Text></View>; }
+const styles = StyleSheet.create({ content: { width: '100%', maxWidth: 960, alignSelf: 'center', gap: 11, paddingBottom: 32 }, nav: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', minHeight: 54 }, back: { minHeight: 44, minWidth: 70, justifyContent: 'center' }, backText: { color: C3S_COLORS.accent, fontSize: 16, fontWeight: '900' }, title: { color: C3S_COLORS.textStrong, fontSize: 32, fontWeight: '900' }, subtitle: { color: C3S_COLORS.textMuted, fontSize: 15, fontWeight: '600', marginTop: -7 }, metrics: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 }, metric: { flex: 1, minWidth: 75, backgroundColor: C3S_COLORS.panel, borderWidth: 1, borderColor: C3S_COLORS.border, borderRadius: 13, padding: 12 }, metricValue: { color: C3S_COLORS.accent, fontSize: 26, fontWeight: '900' }, metricLabel: { color: C3S_COLORS.textMuted, fontSize: 11, fontWeight: '800' }, section: { color: C3S_COLORS.textStrong, fontSize: 20, fontWeight: '900', marginTop: 5 }, empty: { color: C3S_COLORS.textMuted, backgroundColor: C3S_COLORS.panel, borderWidth: 1, borderColor: C3S_COLORS.border, borderRadius: 13, padding: 16, fontSize: 14, fontWeight: '700' }, note: { backgroundColor: C3S_COLORS.accentSoft, borderRadius: 13, padding: 14, marginTop: 5 }, noteTitle: { color: C3S_COLORS.navy, fontSize: 15, fontWeight: '900' }, noteText: { color: C3S_COLORS.textMuted, fontSize: 13, lineHeight: 19, fontWeight: '600', marginTop: 4 } });

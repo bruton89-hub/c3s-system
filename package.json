@@ -1,7 +1,7 @@
 {
   "name": "c3s-preview",
   "main": "expo-router/entry",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "scripts": {
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
@@ -13,7 +13,12 @@
     "seed:products": "node ./scripts/seed-products.mjs",
     "seed:product-profiles": "node ./scripts/seed-product-profiles.mjs",
     "check:data-state": "node ./scripts/check-data-state.mjs",
-    "normalize:legacy": "node ./scripts/normalize-legacy-stage-qa.mjs"
+    "normalize:legacy": "node ./scripts/normalize-legacy-stage-qa.mjs",
+    "test": "node ./scripts/run-tests.mjs",
+    "test:rules": "firebase emulators:exec --only firestore \"node --test tests/firestore.rules.test.mjs\"",
+    "test:functions": "npm --prefix functions test",
+    "test:lifecycle": "firebase emulators:exec --only firestore \"npm --prefix functions run test:e2e\"",
+    "verify:staging": "node ./scripts/verify-staging-target.mjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
@@ -45,6 +50,7 @@
     "react-native-worklets": "0.5.1"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^4.0.1",
     "@types/react": "~19.1.0",
     "babel-preset-expo": "~54.0.10",
     "eslint": "^9.25.0",

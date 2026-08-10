@@ -15,7 +15,9 @@ import {
 } from 'react-native';
 
 import { C3S_COLORS, C3S_RADIUS } from '@/constants/c3s-ui';
+import { C3SLogo } from '@/components/c3s-brand';
 import { useAuth } from '@/lib/auth/context';
+import { isStagingEnvironment } from '@/lib/environment';
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -72,8 +74,10 @@ export default function SignInScreen() {
       <View style={styles.card}>
         {/* Header */}
         <View style={styles.headerBlock}>
-          <Text style={styles.title}>C3S Systems</Text>
-          <Text style={styles.subtitle}>Internal Operations</Text>
+          <C3SLogo />
+          {isStagingEnvironment ? <Text style={styles.stagingLabel}>C3S STAGING</Text> : null}
+          <Text style={styles.title}>Production Flow System</Text>
+          <Text style={styles.subtitle}>Sign in to continue</Text>
         </View>
 
         {/* Error banner */}
@@ -156,6 +160,19 @@ const styles = StyleSheet.create({
     padding: 32,
     gap: 12,
   },
+  stagingLabel: {
+    alignSelf: 'center',
+    color: C3S_COLORS.warning,
+    backgroundColor: C3S_COLORS.warningSoft,
+    borderColor: C3S_COLORS.warning,
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    fontSize: 13,
+    fontWeight: '900',
+    letterSpacing: 1.3,
+  },
   headerBlock: {
     alignItems: 'center',
     marginBottom: 8,
@@ -175,7 +192,7 @@ const styles = StyleSheet.create({
     color: C3S_COLORS.danger,
     fontSize: 13,
     textAlign: 'center',
-    backgroundColor: '#2a1010',
+    backgroundColor: C3S_COLORS.dangerSoft,
     borderRadius: 6,
     paddingVertical: 8,
     paddingHorizontal: 12,
@@ -193,7 +210,7 @@ const styles = StyleSheet.create({
   input: {
     borderWidth: 1,
     borderColor: C3S_COLORS.border,
-    backgroundColor: C3S_COLORS.bg,
+    backgroundColor: '#FFFFFF',
     color: C3S_COLORS.textPrimary,
     borderRadius: 6,
     paddingHorizontal: 12,
@@ -216,7 +233,7 @@ const styles = StyleSheet.create({
     opacity: 0.55,
   },
   btnText: {
-    color: '#0D1117',
+    color: '#FFFFFF',
     fontWeight: '800',
     fontSize: 15,
     letterSpacing: 0.3,

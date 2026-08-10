@@ -21,6 +21,7 @@ import {
   getDocs,
   orderBy,
   query,
+  serverTimestamp,
   Timestamp,
   updateDoc,
   where,
@@ -28,6 +29,7 @@ import {
 } from 'firebase/firestore';
 
 import { collectionRef, docRef } from '@/lib/firebase/collections';
+import { auth } from '@/lib/firebase/config';
 import type {
   OperationalEventDepartment,
   OperationalEventDoc,
@@ -133,10 +135,13 @@ export async function getUnresolvedEvents(): Promise<OperationalEvent[]> {
 }
 
 export async function recordOperationalEvent(input: NewOperationalEventInput): Promise<string> {
+  const user = auth?.currentUser;
+  if (!user) throw new Error('Sign in is required to record an operational event.');
   const payload: OperationalEventDoc = removeUndefinedFields({
     ...input,
+    actorId: user.uid,
     resolved: input.resolved ?? false,
-    createdAt: input.createdAt ?? Timestamp.now(),
+    createdAt: serverTimestamp(),
   } as OperationalEventDoc);
   const ref = await addDoc(collectionRef('operational_events'), payload);
   return ref.id;
@@ -148,11 +153,14 @@ export async function createOperationalEvent(input: NewOperationalEventInput): P
 
 export async function resolveOperationalEvent(
   eventId: string,
-  resolvedBy: string,
+  resolvedByName: string,
 ): Promise<void> {
+  const user = auth?.currentUser;
+  if (!user) throw new Error('Sign in is required to resolve an operational event.');
   await updateDoc(docRef('operational_events', eventId), removeUndefinedFields({
     resolved: true,
-    resolvedBy,
-    resolvedAt: Timestamp.now(),
+    resolvedBy: user.uid,
+    resolvedByName,
+    resolvedAt: serverTimestamp(),
   }));
 }

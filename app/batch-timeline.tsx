@@ -4,6 +4,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader, C3SSectionTitle } from '@/components/c3s-ui';
 import { BATCH_STATUS_COLORS, STAGE_COLORS, getStageDisplayLabel } from '@/constants/c3s';
+import { C3S_COLORS } from '@/constants/c3s-ui';
 import { useC3S, type BatchTimelineAction } from '@/store/c3s-store';
 
 function getParamString(value: string | string[] | undefined, fallback: string): string {
@@ -158,7 +159,9 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   backButton: {
-    backgroundColor: '#30363D',
+    backgroundColor: C3S_COLORS.panel,
+    borderWidth: 1,
+    borderColor: C3S_COLORS.accent,
     borderRadius: 10,
     minHeight: 44,
     paddingHorizontal: 14,
@@ -166,12 +169,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   backButtonText: {
-    color: '#F0F6FC',
+    color: C3S_COLORS.accent,
     fontSize: 15,
     fontWeight: '800',
   },
   screenTitle: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textStrong,
     fontSize: 32,
     fontWeight: '800',
     letterSpacing: 0.2,
@@ -183,7 +186,7 @@ const styles = StyleSheet.create({
     marginBottom: 10,
   },
   batchId: {
-    color: '#F0F6FC',
+    color: C3S_COLORS.textStrong,
     fontSize: 22,
     fontWeight: '800',
   },
@@ -193,7 +196,7 @@ const styles = StyleSheet.create({
     paddingVertical: 5,
   },
   statusText: {
-    color: '#0D1117',
+    color: '#FFFFFF',
     fontSize: 13,
     fontWeight: '800',
   },
@@ -203,17 +206,17 @@ const styles = StyleSheet.create({
     marginTop: 3,
   },
   metaLabel: {
-    color: '#9DA7B1',
+    color: C3S_COLORS.textMuted,
     fontSize: 16,
     fontWeight: '600',
   },
   metaValue: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 17,
     fontWeight: '700',
   },
   etaValue: {
-    color: '#A5D6A7',
+    color: C3S_COLORS.success,
     fontSize: 20,
     fontWeight: '800',
   },
@@ -230,8 +233,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: 10,
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#161B22',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 12,
     padding: 12,
     minHeight: 76,
@@ -241,24 +244,24 @@ const styles = StyleSheet.create({
     height: 10,
     borderRadius: 5,
     marginTop: 6,
-    backgroundColor: '#4FC3F7',
+    backgroundColor: C3S_COLORS.info,
   },
   eventContent: {
     flex: 1,
   },
   eventTime: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 14,
     fontWeight: '700',
     marginBottom: 1,
   },
   eventTitle: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textStrong,
     fontSize: 17,
     fontWeight: '800',
   },
   eventDetail: {
-    color: '#AAB4BE',
+    color: C3S_COLORS.textMuted,
     fontSize: 15,
     fontWeight: '600',
     marginTop: 1,
@@ -281,15 +284,15 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   noActionText: {
-    color: '#9DA7B1',
+    color: C3S_COLORS.textMuted,
     fontSize: 14,
     fontWeight: '700',
   },
   blueAction: {
-    backgroundColor: '#1565C0',
+    backgroundColor: C3S_COLORS.accent,
   },
   orangeAction: {
-    backgroundColor: '#EF6C00',
+    backgroundColor: C3S_COLORS.warning,
   },
   fullWidth: {
     flexBasis: '100%',

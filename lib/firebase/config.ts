@@ -1,7 +1,9 @@
 import Constants from 'expo-constants';
-import { getApp, getApps, initializeApp } from 'firebase/app';
-import { getAuth, type Auth } from 'firebase/auth';
-import { getFirestore, type Firestore } from 'firebase/firestore';
+import { getApp, getApps, initializeApp, type FirebaseApp } from 'firebase/app';
+import { connectAuthEmulator, getAuth, type Auth } from 'firebase/auth';
+import { connectFirestoreEmulator, getFirestore, type Firestore } from 'firebase/firestore';
+
+import { getRuntimeEnvironmentErrors } from '@/lib/environment';
 
 // ── Two-source config loading ────────────────────────────────────────────────
 //
@@ -97,6 +99,12 @@ function getFirebaseConfigFromEnv(): {
 console.log('[BOOT_1] Firebase config module loading');
 
 const { config, missingKeys, presentKeys, source } = getFirebaseConfigFromEnv();
+const environmentErrors = getRuntimeEnvironmentErrors(config.projectId);
+const useFirebaseEmulators = Boolean((Constants.expoConfig?.extra as Record<string, unknown> | null | undefined)?.useFirebaseEmulators)
+  || process.env.EXPO_PUBLIC_USE_FIREBASE_EMULATORS === 'true';
+if (useFirebaseEmulators && !config.projectId.startsWith('demo-')) {
+  environmentErrors.push('Firebase emulator mode requires a demo- project ID.');
+}
 
 // Safe: logs which keys are present/missing and which source provided them.
 // Never logs values.
@@ -109,12 +117,14 @@ console.log('[BOOT_2] Firebase env check', {
   projectId:    config.projectId ? '(set)' : '(empty)',
 });
 
-export const firebaseReady = missingKeys.length === 0;
+export const firebaseReady = missingKeys.length === 0 && environmentErrors.length === 0;
 export const firebaseConfigError = firebaseReady
   ? null
-  : `C3S startup error: Firebase configuration missing. Missing keys: ${missingKeys.join(', ')}`;
+  : environmentErrors.length > 0
+    ? `C3S startup error: Environment isolation check failed. ${environmentErrors.join(' ')}`
+    : `C3S startup error: Firebase configuration missing. Missing keys: ${missingKeys.join(', ')}`;
 
-let firebaseApp = null;
+export let firebaseApp: FirebaseApp | null = null;
 let dbInstance: Firestore | null = null;
 let authInstance: Auth | null = null;
 // Tracks whether Firebase actually initialized — not just whether env vars were present.
@@ -128,6 +138,10 @@ if (firebaseReady) {
     firebaseApp = getApps().length > 0 ? getApp() : initializeApp(config);
     dbInstance = getFirestore(firebaseApp);
     authInstance = getAuth(firebaseApp);
+    if (useFirebaseEmulators) {
+      connectFirestoreEmulator(dbInstance, '127.0.0.1', 8085);
+      connectAuthEmulator(authInstance, 'http://127.0.0.1:9099', { disableWarnings: true });
+    }
     _firebaseInitialized = true;
     // eslint-disable-next-line no-console
     console.log('[BOOT_4] Firebase initialized OK', { projectId: config.projectId ? '(set)' : '(empty)' });

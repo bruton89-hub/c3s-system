@@ -19,6 +19,7 @@ import type {
   QACheckStatus,
   QACheckType,
   PackagingLogStatus,
+  HoldState,
 } from '@/lib/firebase/models';
 
 // ── Stages ────────────────────────────────────────────────────────────────────
@@ -325,6 +326,10 @@ export interface OItemDoc {
   deviationBy?: string;
   correctiveAction?: string;
   deviationAt?: Timestamp;
+
+  // ── Formal production hold ───────────────────────────────────────────────
+  /** Current hold snapshot. Historical actions live in append-only hold_events. */
+  activeHold?: HoldState | null;
 }
 
 /** OItemDoc hydrated with its Firestore document ID. */

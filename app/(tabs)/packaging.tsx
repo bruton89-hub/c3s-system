@@ -1,15 +1,16 @@
 import { useCallback, useMemo, useState } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { router, useLocalSearchParams } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
 
 import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import { C3SDisclosure, C3SOperatorFocus } from '@/components/operator-ui';
+import { C3S_COLORS } from '@/constants/c3s-ui';
 import {
   getChillLogs,
-  getPackagingLogs,
   getPrepQueueItems,
   getQAChecks,
   type ChillLogItem,
-  type PackagingLogItem,
   type PrepQueueItem,
   type QACheckItem,
 } from '@/lib/firebase/repository';
@@ -18,11 +19,11 @@ import {
   getOperationalItems,
   oItemAppendPackagingNote,
   oItemCompletePackaging,
-  oItemHoldPackaging,
   oItemResumePackaging,
   oItemStartPackaging,
   type OItemItem,
 } from '@/lib/operational-items';
+import { useAuth } from '@/lib/auth/context';
 
 function fmtTs(ms?: number) {
   if (!ms || !Number.isFinite(ms)) return '—';
@@ -38,17 +39,19 @@ function elapsedText(startMs?: number, endMs?: number) {
 }
 
 export default function PackagingScreen() {
+  const { profile } = useAuth();
+  const canPackage = Boolean(profile?.active && ['admin', 'supervisor', 'packaging'].includes(profile.role));
+  const params = useLocalSearchParams<{ itemId?: string }>();
+  const targetItemId = Array.isArray(params.itemId) ? params.itemId[0] : params.itemId;
   const [oItems, setOItems] = useState<OItemItem[]>([]);
   const [qaChecks, setQaChecks] = useState<QACheckItem[]>([]);
   const [preps, setPreps] = useState<PrepQueueItem[]>([]);
   const [chillLogs, setChillLogs] = useState<ChillLogItem[]>([]);
-  const [packagingLogs, setPackagingLogs] = useState<PackagingLogItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [workingId, setWorkingId] = useState<string | null>(null);
 
-  const [holdReasonByLogId, setHoldReasonByLogId] = useState<Record<string, string>>({});
   const [noteByLogId, setNoteByLogId] = useState<Record<string, string>>({});
   const [casesByLogId, setCasesByLogId] = useState<Record<string, string>>({});
   const [unitsByLogId, setUnitsByLogId] = useState<Record<string, string>>({});
@@ -61,14 +64,12 @@ export default function PackagingScreen() {
       getQAChecks(),
       getPrepQueueItems(),
       getChillLogs(),
-      getPackagingLogs(),
     ]);
-    const [oR, qR, pR, chR, logsR] = results;
+    const [oR, qR, pR, chR] = results;
     if (oR.status === 'fulfilled') setOItems(oR.value);
     if (qR.status === 'fulfilled') setQaChecks(qR.value);
     if (pR.status === 'fulfilled') setPreps(pR.value);
     if (chR.status === 'fulfilled') setChillLogs(chR.value);
-    if (logsR.status === 'fulfilled') setPackagingLogs(logsR.value);
     const firstFail = results.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
     if (firstFail) {
       logFirebaseError('Packaging', 'operational_items/qa_checks/prep_queue/chill_logs/packaging_logs', firstFail.reason);
@@ -101,13 +102,13 @@ export default function PackagingScreen() {
   );
 
   const readyForPackaging = useMemo(
-    () => packagingStageItems.filter((item) => item.status === 'ready_for_packaging'),
-    [packagingStageItems],
+    () => packagingStageItems.filter((item) => item.status === 'ready_for_packaging').sort((a, b) => Number(b.id === targetItemId) - Number(a.id === targetItemId)),
+    [packagingStageItems, targetItemId],
   );
 
   const inProgress = useMemo(
-    () => packagingStageItems.filter((item) => item.status === 'packaging_in_progress'),
-    [packagingStageItems],
+    () => packagingStageItems.filter((item) => item.status === 'packaging_in_progress').sort((a, b) => Number(b.id === targetItemId) - Number(a.id === targetItemId)),
+    [packagingStageItems, targetItemId],
   );
 
   const packaged = useMemo(
@@ -167,28 +168,6 @@ export default function PackagingScreen() {
     }
   }
 
-  async function onPlaceHold(item: OItemItem) {
-    const reason = (holdReasonByLogId[item.id] ?? '').trim();
-    if (!item.packagingLogId) {
-      setActionMsg('Missing packaging log linkage.');
-      return;
-    }
-    if (!reason) {
-      setActionMsg('Hold reason is required.');
-      return;
-    }
-    try {
-      setWorkingId(item.id);
-      await oItemHoldPackaging(item.id, item.packagingLogId, reason);
-      setActionMsg(`Placed hold on ${item.productName}.`);
-      await load();
-    } catch (e) {
-      setActionMsg(toOperatorMessage(e, 'Failed to place hold.'));
-    } finally {
-      setWorkingId(null);
-    }
-  }
-
   async function onResume(item: OItemItem) {
     if (!item.packagingLogId) {
       setActionMsg('Missing packaging log linkage.');
@@ -236,6 +215,13 @@ export default function PackagingScreen() {
           subtitle={`Ready for Packaging: ${readyForPackaging.length}`}
           right={<Pressable style={styles.refreshBtn} onPress={load}><Text style={styles.refreshText}>Refresh</Text></Pressable>}
         />
+        <C3SOperatorFocus
+          status={`${inProgress.length} packaging • ${readyForPackaging.length} ready`}
+          action={holdDelay.length > 0 ? 'Resolve Hold' : inProgress.length > 0 ? 'Complete Batch' : readyForPackaging.length > 0 ? 'Start Packaging' : 'No Action Required'}
+          detail={holdDelay.length > 0 ? `${holdDelay.length} held batch${holdDelay.length === 1 ? '' : 'es'} require review.` : 'Enter final counts only when completing the active batch.'}
+          tone={holdDelay.length > 0 ? 'critical' : inProgress.length + readyForPackaging.length > 0 ? 'active' : 'complete'}
+        />
+        {!canPackage ? <Text style={styles.info}>Packaging actions are read-only for your current role.</Text> : null}
 
         <ScrollView contentContainerStyle={styles.content}>
           {isLoading ? <Text style={styles.info}>Loading packaging execution data...</Text> : null}
@@ -249,7 +235,7 @@ export default function PackagingScreen() {
             const chill = item.chillLogId ? chillById[item.chillLogId] : null;
             const qa = item.qaCheckId ? qaChecks.find((q) => q.id === item.qaCheckId) : null;
             return (
-              <C3SCard key={item.id} borderColor="#2F6D8A">
+              <C3SCard key={item.id} borderColor={C3S_COLORS.accent}>
                 <Text style={styles.itemTitle}>{item.productName || prep?.productNameSnapshot || '—'}</Text>
                 <Meta label="Product Code" value={prep?.productCodeSnapshot ?? prep?.productCode ?? '—'} />
                 <Meta label="Cases / Racks" value={`${prep?.cases ?? '—'} / ${item.racks ?? prep?.racks ?? '—'}`} />
@@ -260,9 +246,7 @@ export default function PackagingScreen() {
                 <Meta label="Next Step" value="Start Packaging" />
                 <Meta label="From" value="QA" />
                 <Meta label="To" value="Packaging" />
-                <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onStartPackaging(item)}>
-                  <Text style={styles.primaryBtnText}>{workingId === item.id ? 'Starting...' : 'Start Packaging'}</Text>
-                </Pressable>
+                <View style={styles.actions}><Pressable style={styles.secondaryBtn} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><Text style={styles.secondaryBtnText}>Open Batch</Text></Pressable>{canPackage ? <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onStartPackaging(item)}><Text style={styles.primaryBtnText}>{workingId === item.id ? 'Starting...' : 'Start Packaging'}</Text></Pressable> : null}</View>
               </C3SCard>
             );
           })}
@@ -276,7 +260,7 @@ export default function PackagingScreen() {
               ? new Date(startMs + prep.expectedPackMinutes * 60000).toLocaleString()
               : '—';
             return (
-              <C3SCard key={item.id} borderColor="#FFA726">
+              <C3SCard key={item.id} borderColor={C3S_COLORS.warning}>
                 <Text style={styles.itemTitle}>{item.productName || prep?.productNameSnapshot || '—'}</Text>
                 <Meta label="Start Time" value={fmtTs(startMs)} />
                 <Meta label="Elapsed Time" value={elapsedText(startMs)} />
@@ -286,43 +270,46 @@ export default function PackagingScreen() {
                 <Meta label="From" value="QA" />
                 <Meta label="To" value="Complete" />
                 <View style={styles.rowInput}>
-                  <TextInput style={styles.input} placeholder="Cases" placeholderTextColor="#6E7681" keyboardType="numeric" value={casesByLogId[item.id] ?? ''} onChangeText={(v) => setCasesByLogId((m) => ({ ...m, [item.id]: v }))} />
-                  <TextInput style={styles.input} placeholder="Units" placeholderTextColor="#6E7681" keyboardType="numeric" value={unitsByLogId[item.id] ?? ''} onChangeText={(v) => setUnitsByLogId((m) => ({ ...m, [item.id]: v }))} />
+                  <TextInput style={styles.input} placeholder="Cases" placeholderTextColor={C3S_COLORS.textMuted} keyboardType="numeric" value={casesByLogId[item.id] ?? ''} onChangeText={(v) => setCasesByLogId((m) => ({ ...m, [item.id]: v }))} />
+                  <TextInput style={styles.input} placeholder="Units" placeholderTextColor={C3S_COLORS.textMuted} keyboardType="numeric" value={unitsByLogId[item.id] ?? ''} onChangeText={(v) => setUnitsByLogId((m) => ({ ...m, [item.id]: v }))} />
                 </View>
-                <TextInput style={styles.noteInput} placeholder="Packaging note" placeholderTextColor="#6E7681" value={noteByLogId[item.id] ?? ''} onChangeText={(v) => setNoteByLogId((m) => ({ ...m, [item.id]: v }))} />
-                <TextInput style={styles.noteInput} placeholder="Hold reason" placeholderTextColor="#6E7681" value={holdReasonByLogId[item.id] ?? ''} onChangeText={(v) => setHoldReasonByLogId((m) => ({ ...m, [item.id]: v }))} />
+                <TextInput style={styles.noteInput} placeholder="Packaging note" placeholderTextColor={C3S_COLORS.textMuted} value={noteByLogId[item.id] ?? ''} onChangeText={(v) => setNoteByLogId((m) => ({ ...m, [item.id]: v }))} />
                 <View style={styles.actions}>
-                  <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onMarkPackaged(item)}><Text style={styles.primaryBtnText}>Mark Packaged</Text></Pressable>
-                  <Pressable style={styles.warnBtn} disabled={workingId === item.id} onPress={() => onPlaceHold(item)}><Text style={styles.warnBtnText}>Place Hold</Text></Pressable>
-                  <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onUpdateNote(item)}><Text style={styles.secondaryBtnText}>Add/Update Note</Text></Pressable>
+                  <Pressable style={styles.secondaryBtn} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><Text style={styles.secondaryBtnText}>Open Batch</Text></Pressable>
+                  {canPackage ? <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onMarkPackaged(item)}><Text style={styles.primaryBtnText}>Complete Batch</Text></Pressable> : null}
+                  {canPackage ? <Pressable style={styles.warnBtn} disabled={workingId === item.id} onPress={() => router.push(`/hold?itemId=${encodeURIComponent(item.id)}&mode=place`)}><Text style={styles.warnBtnText}>Place on Hold</Text></Pressable> : null}
+                  {canPackage ? <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onUpdateNote(item)}><Text style={styles.secondaryBtnText}>Add/Update Note</Text></Pressable> : null}
                 </View>
               </C3SCard>
             );
           })}
 
+          <C3SDisclosure title="Completed batches" count={packaged.length}>
           <Text style={styles.sectionTitle}>Packaged</Text>
           {packaged.length === 0 ? <Empty text="No completed packaging logs." /> : null}
           {packaged.map((item) => (
-            <C3SCard key={item.id} borderColor="#66BB6A">
+            <C3SCard key={item.id} borderColor={C3S_COLORS.success}>
               <Text style={styles.itemTitle}>{item.productName}</Text>
               <Meta label="Completed Time" value={fmtTs(item.packagingCompletedAt?.toMillis?.())} />
               <Meta label="Total Elapsed" value={elapsedText(item.packagingStartedAt?.toMillis?.(), item.packagingCompletedAt?.toMillis?.())} />
               <Meta label="Notes" value={item.packagingNotes || '—'} />
+              <Pressable style={styles.secondaryBtn} onPress={() => router.push(`/production-item?id=${encodeURIComponent(item.id)}`)}><Text style={styles.secondaryBtnText}>Open History</Text></Pressable>
             </C3SCard>
           ))}
+          </C3SDisclosure>
 
           <Text style={styles.sectionTitle}>Hold / Delay</Text>
           {holdDelay.length === 0 ? <Empty text="No packaging hold/delay items." /> : null}
           {holdDelay.map((item) => (
-            <C3SCard key={item.id} borderColor="#EF5350">
+            <C3SCard key={item.id} borderColor={C3S_COLORS.danger}>
               <Text style={styles.itemTitle}>{item.productName}</Text>
               <Meta label="Reason" value={item.deviationNotes || '—'} />
               <Meta label="Timestamp" value={fmtTs(item.deviationAt?.toMillis?.())} />
               <Meta label="Source Product" value={item.productName || '—'} />
-              <TextInput style={styles.noteInput} placeholder="Update note" placeholderTextColor="#6E7681" value={noteByLogId[item.id] ?? ''} onChangeText={(v) => setNoteByLogId((m) => ({ ...m, [item.id]: v }))} />
+              <TextInput style={styles.noteInput} placeholder="Update note" placeholderTextColor={C3S_COLORS.textMuted} value={noteByLogId[item.id] ?? ''} onChangeText={(v) => setNoteByLogId((m) => ({ ...m, [item.id]: v }))} />
               <View style={styles.actions}>
-                <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onResume(item)}><Text style={styles.primaryBtnText}>Resume Packaging</Text></Pressable>
-                <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onUpdateNote(item)}><Text style={styles.secondaryBtnText}>Update Note</Text></Pressable>
+                {canPackage ? <Pressable style={styles.primaryBtn} disabled={workingId === item.id} onPress={() => onResume(item)}><Text style={styles.primaryBtnText}>Resume Packaging</Text></Pressable> : null}
+                {canPackage ? <Pressable style={styles.secondaryBtn} disabled={workingId === item.id} onPress={() => onUpdateNote(item)}><Text style={styles.secondaryBtnText}>Update Note</Text></Pressable> : null}
               </View>
             </C3SCard>
           ))}
@@ -353,78 +340,84 @@ const styles = StyleSheet.create({
   content: { gap: 8, paddingBottom: 24 },
   refreshBtn: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 6,
   },
-  refreshText: { color: '#E6EDF3', fontSize: 12, fontWeight: '700' },
-  sectionTitle: { color: '#8AB4F8', fontSize: 13, fontWeight: '800', marginTop: 4 },
-  itemTitle: { color: '#E6EDF3', fontSize: 13, fontWeight: '800', marginBottom: 4 },
-  metaRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8, marginBottom: 2 },
-  metaLabel: { color: '#8B949E', fontSize: 11, fontWeight: '700' },
-  metaValue: { color: '#C9D1D9', fontSize: 11, fontWeight: '600' },
-  rowInput: { flexDirection: 'row', gap: 8, marginTop: 6 },
+  refreshText: { color: C3S_COLORS.textPrimary, fontSize: 13, fontWeight: '800' },
+  sectionTitle: { color: C3S_COLORS.textStrong, fontSize: 19, fontWeight: '900', marginTop: 8 },
+  itemTitle: { color: C3S_COLORS.textStrong, fontSize: 18, fontWeight: '900', marginBottom: 7 },
+  metaRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', gap: 8, marginBottom: 2 },
+  metaLabel: { color: C3S_COLORS.textMuted, fontSize: 13, fontWeight: '700' },
+  metaValue: { color: C3S_COLORS.textPrimary, fontSize: 14, fontWeight: '700', flexShrink: 1, textAlign: 'right' },
+  rowInput: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 },
   input: {
     flex: 1,
+    minWidth: 120,
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#0D1117',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 7,
-    color: '#E6EDF3',
-    fontSize: 12,
+    color: C3S_COLORS.textPrimary,
+    fontSize: 14,
   },
   noteInput: {
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#0D1117',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     borderRadius: 8,
     paddingHorizontal: 8,
     paddingVertical: 7,
-    color: '#E6EDF3',
-    fontSize: 12,
+    color: C3S_COLORS.textPrimary,
+    fontSize: 14,
     marginTop: 6,
   },
   actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 6 },
   primaryBtn: {
+    flexGrow: 1,
+    minWidth: 130,
     borderWidth: 1,
-    borderColor: '#2F6D8A',
-    backgroundColor: '#13314A',
-    borderRadius: 8,
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.accent,
+    borderRadius: 11,
+    minHeight: 48,
     paddingHorizontal: 10,
     paddingVertical: 7,
   },
-  primaryBtnText: { color: '#E6EDF3', fontSize: 11, fontWeight: '700' },
+  primaryBtnText: { color: '#FFFFFF', fontSize: 14, fontWeight: '900' },
   warnBtn: {
+    flexGrow: 1,
+    minWidth: 130,
     borderWidth: 1,
-    borderColor: '#C62828',
-    backgroundColor: '#2A1414',
+    borderColor: C3S_COLORS.danger,
+    backgroundColor: C3S_COLORS.dangerSoft,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 7,
   },
-  warnBtnText: { color: '#FFB4B4', fontSize: 11, fontWeight: '700' },
+  warnBtnText: { color: C3S_COLORS.danger, fontSize: 11, fontWeight: '700' },
   secondaryBtn: {
     borderWidth: 1,
-    borderColor: '#455A64',
-    backgroundColor: '#1A2430',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panelAlt,
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 7,
   },
-  secondaryBtnText: { color: '#CFD8DC', fontSize: 11, fontWeight: '700' },
+  secondaryBtnText: { color: C3S_COLORS.textPrimary, fontSize: 11, fontWeight: '700' },
   emptyCard: {
     borderWidth: 1,
-    borderColor: '#30363D',
+    borderColor: C3S_COLORS.border,
     borderRadius: 8,
-    backgroundColor: '#11161D',
+    backgroundColor: C3S_COLORS.panelAlt,
     paddingVertical: 10,
     paddingHorizontal: 10,
   },
-  emptyText: { color: '#8B949E', fontSize: 12 },
-  info: { color: '#81D4FA', fontSize: 12, fontWeight: '700' },
-  error: { color: '#FF8A80', fontSize: 12, fontWeight: '700' },
+  emptyText: { color: C3S_COLORS.textMuted, fontSize: 12 },
+  info: { color: C3S_COLORS.accent, fontSize: 12, fontWeight: '700' },
+  error: { color: C3S_COLORS.danger, fontSize: 12, fontWeight: '700' },
 });

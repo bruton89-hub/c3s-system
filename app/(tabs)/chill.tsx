@@ -1,8 +1,11 @@
 import { useCallback, useMemo, useState } from 'react';
 import { useFocusEffect } from '@react-navigation/native';
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { router, useLocalSearchParams } from 'expo-router';
 
 import { C3SCard, C3SPage, C3SScreen, C3SScreenHeader } from '@/components/c3s-ui';
+import { C3SDisclosure, C3SOperatorFocus } from '@/components/operator-ui';
+import { C3S_COLORS } from '@/constants/c3s-ui';
 import {
   getChillLogs,
   getChillers,
@@ -24,10 +27,10 @@ import { toMillis, toSafeDate } from '@/lib/utils/dates';
 // Session-level operator identity cache
 let _sessionOnDutyAs = '';
 
-const THEME_BORDER = '#29B6F6';
-const THEME_PILL_BG = '#0D2D3A';
-const THEME_PILL_BORDER = '#1A5A7A';
-const THEME_PILL_TEXT = '#81D4FA';
+const THEME_BORDER = C3S_COLORS.accent;
+const THEME_PILL_BG = C3S_COLORS.accentSoft;
+const THEME_PILL_BORDER = C3S_COLORS.accent;
+const THEME_PILL_TEXT = C3S_COLORS.accent;
 const CANONICAL_CHILLER_NAMES = [
   'Chiller 4', 'Chiller 5', 'Chiller 6', 'Chiller 7', 'Chiller 8', 'Chiller 9',
   'Chiller 10', 'Chiller 11', 'Chiller 12', 'Chiller 13', 'Chiller 14', 'Chiller 15', 'Chiller 16',
@@ -56,6 +59,8 @@ function formatChillerStatusLabel(status: ChillerItem['status']): string {
 }
 
 export default function ChillScreen() {
+  const params = useLocalSearchParams<{ itemId?: string }>();
+  const targetItemId = Array.isArray(params.itemId) ? params.itemId[0] : params.itemId;
   const [oItems, setOItems] = useState<OItemItem[]>([]);
   const [chillLogs, setChillLogs] = useState<ChillLogItem[]>([]);
   const [chillers, setChillers] = useState<ChillerItem[]>([]);
@@ -87,7 +92,6 @@ export default function ChillScreen() {
   const [timeTo50FInput, setTimeTo50FInput] = useState<Record<string, string>>({});
   const [timeTo40FInput, setTimeTo40FInput] = useState<Record<string, string>>({});
   const [signOutTempInput, setSignOutTempInput] = useState<Record<string, string>>({});
-  const [selectedSignOutChillerId, setSelectedSignOutChillerId] = useState<Record<string, string>>({});
   const [selectedStorageCooler, setSelectedStorageCooler] = useState<Record<string, string>>({});
   const [finishingChillLogId, setFinishingChillLogId] = useState<string | null>(null);
   const [signOutError, setSignOutError] = useState<Record<string, string>>({});
@@ -119,10 +123,6 @@ export default function ChillScreen() {
   );
 
   // Derived
-  const chillLogsById = useMemo(
-    () => chillLogs.reduce<Record<string, ChillLogItem>>((map, log) => { map[log.id] = log; return map; }, {}),
-    [chillLogs],
-  );
   const oItemByChillLogId = useMemo(
     () => oItems.reduce<Record<string, OItemItem>>((map, item) => {
       if (item.chillLogId) map[item.chillLogId] = item;
@@ -142,12 +142,12 @@ export default function ChillScreen() {
     [oItems],
   );
   const waitingQueue = useMemo(
-    () => chillLogs.filter((log) => oItemByChillLogId[log.id]?.status === 'awaiting_chill'),
-    [chillLogs, oItemByChillLogId],
+    () => chillLogs.filter((log) => oItemByChillLogId[log.id]?.status === 'awaiting_chill').sort((a, b) => Number(oItemByChillLogId[b.id]?.id === targetItemId) - Number(oItemByChillLogId[a.id]?.id === targetItemId)),
+    [chillLogs, oItemByChillLogId, targetItemId],
   );
   const runningLogs = useMemo(
-    () => chillLogs.filter((log) => oItemByChillLogId[log.id]?.status === 'in_chill'),
-    [chillLogs, oItemByChillLogId],
+    () => chillLogs.filter((log) => oItemByChillLogId[log.id]?.status === 'in_chill').sort((a, b) => Number(oItemByChillLogId[b.id]?.id === targetItemId) - Number(oItemByChillLogId[a.id]?.id === targetItemId)),
+    [chillLogs, oItemByChillLogId, targetItemId],
   );
   const deviationLogs = useMemo(
     () => chillLogs.filter((log) => {
@@ -312,13 +312,20 @@ export default function ChillScreen() {
       <C3SPage>
         <C3SScreenHeader title="Chill" subtitle="Post-cook cooling — bring product to ≤ 40°F before QA handoff" />
 
+        <C3SOperatorFocus
+          status={`${runningLogs.length} chilling • ${waitingQueue.length} waiting`}
+          action={deviationLogs.length > 0 ? 'Resolve Hold' : runningLogs.length > 0 ? 'Record Check' : waitingQueue.length > 0 ? 'Start Chill' : completedCount > 0 ? 'Send to QA' : 'No Action Required'}
+          detail={deviationLogs.length > 0 ? `${deviationLogs.length} deviation${deviationLogs.length === 1 ? '' : 's'} must be resolved before QA handoff.` : 'Temperature validation and required milestones remain unchanged.'}
+          tone={deviationLogs.length > 0 ? 'critical' : runningLogs.length + waitingQueue.length > 0 ? 'active' : 'complete'}
+        />
+
         {/* ── On Duty Banner ── */}
-        <C3SCard borderColor={onDutyAs.trim() ? THEME_BORDER : '#455A64'}>
+        <C3SCard borderColor={onDutyAs.trim() ? THEME_BORDER : C3S_COLORS.border}>
           <Text style={styles.onDutyLabel}>Chill Operator — On Duty As</Text>
           <TextInput
             style={styles.onDutyInput}
             placeholder="Enter your name"
-            placeholderTextColor="#6E7681"
+            placeholderTextColor={C3S_COLORS.textMuted}
             value={onDutyAs}
             onChangeText={(v) => {
               setOnDutyAs(v);
@@ -331,22 +338,22 @@ export default function ChillScreen() {
 
         {/* ── Summary Pills ── */}
         <View style={styles.summaryRow}>
-          <View style={[styles.summaryPill, { borderColor: '#26A69A', backgroundColor: '#0D2A28' }]}>
-            <Text style={[styles.summaryCount, { color: '#80CBC4' }]}>{waitingQueue.length}</Text>
-            <Text style={[styles.summaryLabel, { color: '#80CBC4' }]}>Awaiting Chiller Assignment</Text>
+          <View style={[styles.summaryPill, { borderColor: C3S_COLORS.success, backgroundColor: C3S_COLORS.successSoft }]}>
+            <Text style={[styles.summaryCount, { color: C3S_COLORS.success }]}>{waitingQueue.length}</Text>
+            <Text style={[styles.summaryLabel, { color: C3S_COLORS.success }]}>Awaiting Chiller Assignment</Text>
           </View>
           <View style={[styles.summaryPill, { borderColor: THEME_BORDER, backgroundColor: THEME_PILL_BG }]}>
             <Text style={[styles.summaryCount, { color: THEME_PILL_TEXT }]}>{runningLogs.length}</Text>
             <Text style={[styles.summaryLabel, { color: THEME_PILL_TEXT }]}>Running Chill</Text>
           </View>
-          <View style={[styles.summaryPill, { borderColor: '#66BB6A', backgroundColor: '#0D2A14' }]}>
-            <Text style={[styles.summaryCount, { color: '#A5D6A7' }]}>{completedCount}</Text>
-            <Text style={[styles.summaryLabel, { color: '#A5D6A7' }]}>Ready for QA</Text>
+          <View style={[styles.summaryPill, { borderColor: C3S_COLORS.success, backgroundColor: C3S_COLORS.successSoft }]}>
+            <Text style={[styles.summaryCount, { color: C3S_COLORS.success }]}>{completedCount}</Text>
+            <Text style={[styles.summaryLabel, { color: C3S_COLORS.success }]}>Ready for QA</Text>
           </View>
           {deviationLogs.length > 0 ? (
-            <View style={[styles.summaryPill, { borderColor: '#EF5350', backgroundColor: '#1E0808' }]}>
-              <Text style={[styles.summaryCount, { color: '#EF9A9A' }]}>{deviationLogs.length}</Text>
-              <Text style={[styles.summaryLabel, { color: '#EF9A9A' }]}>Deviations</Text>
+            <View style={[styles.summaryPill, { borderColor: C3S_COLORS.danger, backgroundColor: C3S_COLORS.dangerSoft }]}>
+              <Text style={[styles.summaryCount, { color: C3S_COLORS.danger }]}>{deviationLogs.length}</Text>
+              <Text style={[styles.summaryLabel, { color: C3S_COLORS.danger }]}>Deviations</Text>
             </View>
           ) : null}
         </View>
@@ -356,7 +363,7 @@ export default function ChillScreen() {
             <Text style={styles.loadingText}>Loading chill data…</Text>
           </C3SCard>
         ) : loadError ? (
-          <C3SCard borderColor="#EF5350">
+          <C3SCard borderColor={C3S_COLORS.danger}>
             <Text style={styles.errorText}>{loadError}</Text>
             <Pressable style={styles.retryButton} onPress={loadData}>
               <Text style={styles.retryButtonText}>Retry</Text>
@@ -368,8 +375,7 @@ export default function ChillScreen() {
             {/* ══════════════════════════════════════════
                 SECTION 1 · Post-Cook Handoff Queue
             ══════════════════════════════════════════ */}
-            <Text style={styles.sectionTitle}>1 · Cook Complete — Awaiting Chiller Assignment</Text>
-            <Text style={styles.sectionSub}>Products handed off from Thermal — assign to a chiller to start the chill cycle</Text>
+            <C3SDisclosure title="Incoming handoffs" count={waitingQueue.length}>
 
             {waitingQueue.length === 0 ? (
               <C3SCard>
@@ -378,18 +384,18 @@ export default function ChillScreen() {
               </C3SCard>
             ) : (
               waitingQueue.map((log) => (
-                <C3SCard key={log.id} borderColor={log.thermalDeviationCount || log.hasDeviation ? '#FF6B35' : '#26A69A'}>
+                <C3SCard key={log.id} borderColor={log.thermalDeviationCount || log.hasDeviation ? C3S_COLORS.danger : C3S_COLORS.success}>
                   <View style={styles.topRow}>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.productName}>{log.productName}</Text>
                     </View>
                     {log.thermalDeviationCount || log.hasDeviation ? (
-                      <View style={[styles.statusPill, { backgroundColor: '#3A1400', borderColor: '#FF6B35', marginRight: 6 }]}>
-                        <Text style={[styles.statusPillText, { color: '#FF8C5A' }]}>⚠ DEVIATION</Text>
+                      <View style={[styles.statusPill, { backgroundColor: C3S_COLORS.dangerSoft, borderColor: C3S_COLORS.danger, marginRight: 6 }]}>
+                        <Text style={[styles.statusPillText, { color: C3S_COLORS.warning }]}>⚠ DEVIATION</Text>
                       </View>
                     ) : null}
-                    <View style={[styles.statusPill, { backgroundColor: '#123436', borderColor: '#1D5A5E' }]}>
-                      <Text style={[styles.statusPillText, { color: '#7BE0E5' }]}>AWAITING CHILLER ASSIGNMENT</Text>
+                    <View style={[styles.statusPill, { backgroundColor: C3S_COLORS.accentSoft, borderColor: C3S_COLORS.accent }]}>
+                      <Text style={[styles.statusPillText, { color: C3S_COLORS.accent }]}>AWAITING CHILLER ASSIGNMENT</Text>
                     </View>
                   </View>
                   <View style={styles.metaRow}>
@@ -414,16 +420,17 @@ export default function ChillScreen() {
                   </View>
                   <View style={styles.metaRow}>
                     <Text style={styles.metaLabel}>Next Step</Text>
-                    <Text style={[styles.metaValue, { color: '#80CBC4' }]}>→ Assign to Chiller and Start Chill in Section 2</Text>
+                    <Text style={[styles.metaValue, { color: C3S_COLORS.success }]}>→ Assign to Chiller and Start Chill in Section 2</Text>
                   </View>
                 </C3SCard>
               ))
             )}
+            </C3SDisclosure>
 
             {/* ══════════════════════════════════════════
                 SECTION 2 · Assign to Chiller / Start Chill
             ══════════════════════════════════════════ */}
-            <Text style={styles.sectionTitle}>2 · Assign to Chiller / Start Chill</Text>
+            <Text style={styles.sectionTitle}>Start Chill</Text>
             <Text style={styles.sectionSub}>Select a handoff and a chiller, then start the chill cycle</Text>
 
             {waitingQueue.length === 0 ? (
@@ -485,6 +492,7 @@ export default function ChillScreen() {
                     {selectedChiller ? `${selectedChiller.name} [${formatChillerStatusLabel(selectedChiller.status)}]` : 'None'}
                   </Text>
                 </View>
+                {selectedWaitingLog && oItemByChillLogId[selectedWaitingLog.id] ? <Pressable style={styles.openBatchButton} onPress={() => router.push(`/production-item?id=${encodeURIComponent(oItemByChillLogId[selectedWaitingLog.id].id)}`)}><Text style={styles.openBatchText}>Open Batch</Text></Pressable> : null}
 
                 {startChillError ? (
                   <Text style={styles.execError}>{startChillError}</Text>
@@ -498,7 +506,7 @@ export default function ChillScreen() {
                   disabled={!selectedWaitingChillLogId || !selectedChillerName || isStartingChill}
                   onPress={onStartChillSubmit}>
                   <Text style={styles.primaryActionText}>
-                    {isStartingChill ? 'Starting Chill…' : 'Assign to Chiller / Start Chill'}
+                    {isStartingChill ? 'Starting Chill…' : 'Start Chill'}
                   </Text>
                 </Pressable>
               </C3SCard>
@@ -507,7 +515,7 @@ export default function ChillScreen() {
             {/* ══════════════════════════════════════════
                 SECTION 3 · Running Chill
             ══════════════════════════════════════════ */}
-            <Text style={styles.sectionTitle}>3 · Chill Running</Text>
+            <Text style={styles.sectionTitle}>Chill Running</Text>
             <Text style={styles.sectionSub}>Active chill cycles — record temp milestones, sign out when product is ≤ 40°F</Text>
 
             {runningLogs.length === 0 ? (
@@ -525,14 +533,14 @@ export default function ChillScreen() {
                 const canFinishChill = !!equipmentOk;
 
                 return (
-                  <C3SCard key={log.id} borderColor={log.thermalDeviationCount || log.hasDeviation ? '#FF6B35' : THEME_BORDER}>
+                  <C3SCard key={log.id} borderColor={log.thermalDeviationCount || log.hasDeviation ? C3S_COLORS.danger : THEME_BORDER}>
                     <View style={styles.topRow}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.productName}>{log.productName}</Text>
                       </View>
                       {log.thermalDeviationCount || log.hasDeviation ? (
-                        <View style={[styles.statusPill, { backgroundColor: '#3A1400', borderColor: '#FF6B35', marginRight: 6 }]}>
-                          <Text style={[styles.statusPillText, { color: '#FF8C5A' }]}>⚠ DEVIATION</Text>
+                        <View style={[styles.statusPill, { backgroundColor: C3S_COLORS.dangerSoft, borderColor: C3S_COLORS.danger, marginRight: 6 }]}>
+                          <Text style={[styles.statusPillText, { color: C3S_COLORS.warning }]}>⚠ DEVIATION</Text>
                         </View>
                       ) : null}
                       <View style={[styles.statusPill, { backgroundColor: THEME_PILL_BG, borderColor: THEME_PILL_BORDER }]}>
@@ -579,6 +587,7 @@ export default function ChillScreen() {
                         ⚠ Equipment linkage issue — chiller may be assigned to a different load.
                       </Text>
                     ) : null}
+                    {oItemByChillLogId[log.id] ? <Pressable style={styles.openBatchButton} onPress={() => router.push(`/production-item?id=${encodeURIComponent(oItemByChillLogId[log.id].id)}`)}><Text style={styles.openBatchText}>Open Batch</Text></Pressable> : null}
 
                     {/* Temp Milestones */}
                     <Text style={styles.stepHeader}>Chill Temp Milestones</Text>
@@ -587,7 +596,7 @@ export default function ChillScreen() {
                       <TextInput
                         style={styles.execInput}
                         placeholder="Mins to 50°F"
-                        placeholderTextColor="#6E7681"
+                        placeholderTextColor={C3S_COLORS.textMuted}
                         keyboardType="numeric"
                         value={timeTo50FInput[log.id] ?? ''}
                         onChangeText={(v) => setTimeTo50FInput((prev) => ({ ...prev, [log.id]: v }))}
@@ -595,7 +604,7 @@ export default function ChillScreen() {
                       <TextInput
                         style={styles.execInput}
                         placeholder="Mins to 40°F"
-                        placeholderTextColor="#6E7681"
+                        placeholderTextColor={C3S_COLORS.textMuted}
                         keyboardType="numeric"
                         value={timeTo40FInput[log.id] ?? ''}
                         onChangeText={(v) => setTimeTo40FInput((prev) => ({ ...prev, [log.id]: v }))}
@@ -607,7 +616,7 @@ export default function ChillScreen() {
                     <TextInput
                       style={styles.execInput}
                       placeholder="Sign-out temp (°F) — must be ≤ 40°F"
-                      placeholderTextColor="#6E7681"
+                      placeholderTextColor={C3S_COLORS.textMuted}
                       keyboardType="numeric"
                       value={signOutTempInput[log.id] ?? ''}
                       onChangeText={(v) => {
@@ -653,7 +662,7 @@ export default function ChillScreen() {
                       disabled={finishingChillLogId === log.id || !canFinishChill}
                       onPress={() => onFinishChillSubmit(log)}>
                         <Text style={styles.finishActionText}>
-                        {finishingChillLogId === log.id ? 'Completing Chill…' : 'Complete Chill → Ready for QA'}
+                        {finishingChillLogId === log.id ? 'Completing Chill…' : 'Complete Chill'}
                       </Text>
                     </Pressable>
 
@@ -668,7 +677,7 @@ export default function ChillScreen() {
                         <TextInput
                           style={[styles.execInput, { minHeight: 56 }]}
                           placeholder="e.g. Chiller malfunction, unexpected temp spike, equipment issue..."
-                          placeholderTextColor="#6E7681"
+                          placeholderTextColor={C3S_COLORS.textMuted}
                           value={deviationReasonInput[log.id] ?? ''}
                           onChangeText={(v) => setDeviationReasonInput((prev) => ({ ...prev, [log.id]: v }))}
                           multiline
@@ -701,21 +710,21 @@ export default function ChillScreen() {
             ══════════════════════════════════════════ */}
             {deviationLogs.length > 0 ? (
               <>
-                <Text style={[styles.sectionTitle, { color: '#EF9A9A' }]}>⚠ Chill Deviations</Text>
+                <Text style={[styles.sectionTitle, { color: C3S_COLORS.danger }]}>⚠ Chill Deviations</Text>
                 <Text style={styles.sectionSub}>Flagged items — resolve with corrective action before QA handoff</Text>
                 {deviationLogs.map((log) => (
-                  <C3SCard key={log.id} borderColor="#EF5350">
+                  <C3SCard key={log.id} borderColor={C3S_COLORS.danger}>
                     <View style={styles.topRow}>
                       <View style={{ flex: 1 }}>
                         <Text style={styles.productName}>{log.productName}</Text>
                       </View>
-                      <View style={[styles.statusPill, { backgroundColor: '#2A0808', borderColor: '#7A2020' }]}>
-                        <Text style={[styles.statusPillText, { color: '#EF9A9A' }]}>DEVIATION</Text>
+                      <View style={[styles.statusPill, { backgroundColor: C3S_COLORS.dangerSoft, borderColor: C3S_COLORS.danger }]}>
+                        <Text style={[styles.statusPillText, { color: C3S_COLORS.danger }]}>DEVIATION</Text>
                       </View>
                     </View>
                     <View style={styles.metaRow}>
                       <Text style={styles.metaLabel}>Reason</Text>
-                      <Text style={[styles.metaValue, { color: '#EF9A9A', textAlign: 'left', flex: 2 }]}>{log.deviationReason ?? '—'}</Text>
+                      <Text style={[styles.metaValue, { color: C3S_COLORS.danger, textAlign: 'left', flex: 2 }]}>{log.deviationReason ?? '—'}</Text>
                     </View>
                     <View style={styles.metaRow}>
                       <Text style={styles.metaLabel}>Flagged At</Text>
@@ -741,7 +750,7 @@ export default function ChillScreen() {
                         <TextInput
                           style={[styles.execInput, { minHeight: 56 }]}
                           placeholder="Describe what was done to correct the issue..."
-                          placeholderTextColor="#6E7681"
+                          placeholderTextColor={C3S_COLORS.textMuted}
                           value={deviationResolutionInput[log.id] ?? ''}
                           onChangeText={(v) => setDeviationResolutionInput((prev) => ({ ...prev, [log.id]: v }))}
                           multiline
@@ -780,28 +789,30 @@ export default function ChillScreen() {
 const styles = StyleSheet.create({
   // On Duty
   onDutyLabel: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '700',
     marginBottom: 4,
   },
   onDutyInput: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 15,
     fontWeight: '700',
     borderBottomWidth: 1,
-    borderBottomColor: '#29B6F6',
+    borderBottomColor: C3S_COLORS.accent,
     paddingVertical: 4,
   },
 
   // Summary pills
   summaryRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
     marginBottom: 10,
   },
   summaryPill: {
     flex: 1,
+    minWidth: 100,
     borderWidth: 1,
     borderRadius: 10,
     paddingVertical: 10,
@@ -826,14 +837,14 @@ const styles = StyleSheet.create({
 
   // Section headers
   sectionTitle: {
-    color: '#E6EDF3',
-    fontSize: 16,
-    fontWeight: '800',
+    color: C3S_COLORS.textStrong,
+    fontSize: 19,
+    fontWeight: '900',
     marginTop: 6,
     marginBottom: 2,
   },
   sectionSub: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '600',
     marginBottom: 8,
@@ -847,12 +858,12 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   productName: {
-    color: '#E6EDF3',
-    fontSize: 16,
-    fontWeight: '800',
+    color: C3S_COLORS.textStrong,
+    fontSize: 18,
+    fontWeight: '900',
   },
   subId: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '600',
     marginTop: 2,
@@ -877,12 +888,12 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   metaLabel: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '600',
   },
   metaValue: {
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 13,
     fontWeight: '700',
     textAlign: 'right',
@@ -891,7 +902,7 @@ const styles = StyleSheet.create({
 
   // Assign card
   assignLabel: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '700',
     marginBottom: 6,
@@ -906,40 +917,40 @@ const styles = StyleSheet.create({
   chip: {
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: '#30363D',
-    backgroundColor: '#151A21',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     paddingHorizontal: 12,
     paddingVertical: 8,
     alignItems: 'center',
   },
   chipActive: {
-    borderColor: '#29B6F6',
-    backgroundColor: '#0D2D3A',
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.accentSoft,
   },
   chipBusy: {
-    borderColor: '#455A64',
-    backgroundColor: '#1A1F26',
+    borderColor: C3S_COLORS.border,
+    backgroundColor: C3S_COLORS.panel,
     opacity: 0.6,
   },
   chipText: {
-    color: '#AAB4BE',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '700',
   },
   chipTextActive: {
-    color: '#81D4FA',
+    color: C3S_COLORS.accent,
   },
   chipTextBusy: {
-    color: '#607D8B',
+    color: C3S_COLORS.textMuted,
   },
   chipSub: {
-    color: '#6E7681',
+    color: C3S_COLORS.textMuted,
     fontSize: 11,
     fontWeight: '600',
     marginTop: 2,
   },
   chipSubActive: {
-    color: '#4FC3F7',
+    color: C3S_COLORS.info,
   },
   chillerGrid: {
     flexDirection: 'row',
@@ -950,40 +961,40 @@ const styles = StyleSheet.create({
     width: 118,
     minHeight: 84,
     borderWidth: 1.5,
-    borderColor: '#30363D',
+    borderColor: C3S_COLORS.border,
     borderRadius: 12,
-    backgroundColor: '#151A21',
+    backgroundColor: C3S_COLORS.panel,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 8,
     paddingVertical: 10,
   },
   chillerChipActive: {
-    borderColor: '#29B6F6',
-    backgroundColor: '#0D2D3A',
-    shadowColor: '#29B6F6',
+    borderColor: C3S_COLORS.accent,
+    backgroundColor: C3S_COLORS.accentSoft,
+    shadowColor: C3S_COLORS.accent,
     shadowOpacity: 0.35,
     shadowRadius: 6,
   },
   chillerChipBusy: {
-    backgroundColor: '#101419',
-    borderColor: '#2D333B',
+    backgroundColor: C3S_COLORS.panelAlt,
+    borderColor: C3S_COLORS.border,
     opacity: 0.6,
   },
   chillerChipName: {
-    color: '#D0D7DE',
+    color: C3S_COLORS.textPrimary,
     fontSize: 15,
     fontWeight: '800',
     textAlign: 'center',
   },
   chillerChipNameActive: {
-    color: '#81D4FA',
+    color: C3S_COLORS.accent,
   },
   chillerChipNameBusy: {
-    color: '#768390',
+    color: C3S_COLORS.textMuted,
   },
   chillerChipStatus: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 11,
     fontWeight: '700',
     textTransform: 'uppercase',
@@ -991,32 +1002,32 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   chillerChipStatusActive: {
-    color: '#C6EAFD',
+    color: C3S_COLORS.textPrimary,
   },
 
   // Chill timer banner (elapsed time display)
   chillTimerBanner: {
-    backgroundColor: '#031520',
+    backgroundColor: C3S_COLORS.panelAlt,
     borderWidth: 1,
-    borderColor: '#1A5A7A',
+    borderColor: C3S_COLORS.accent,
     borderRadius: 8,
     paddingHorizontal: 12,
     paddingVertical: 8,
     marginBottom: 8,
   },
-  chillTimerText: { color: '#81D4FA', fontSize: 16, fontWeight: '800' },
-  chillTimerSub: { color: '#4FC3F7', fontSize: 12, fontWeight: '700', marginTop: 2 },
+  chillTimerText: { color: C3S_COLORS.accent, fontSize: 16, fontWeight: '800' },
+  chillTimerSub: { color: C3S_COLORS.info, fontSize: 12, fontWeight: '700', marginTop: 2 },
 
   // Step headers within running chill card
   stepHeader: {
-    color: '#AAB4BE',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '700',
     marginTop: 12,
     marginBottom: 4,
   },
   stepHint: {
-    color: '#6E7681',
+    color: C3S_COLORS.textMuted,
     fontSize: 11,
     fontWeight: '600',
     marginBottom: 6,
@@ -1029,11 +1040,11 @@ const styles = StyleSheet.create({
   },
   execInput: {
     flex: 1,
-    backgroundColor: '#0D1117',
+    backgroundColor: C3S_COLORS.panel,
     borderWidth: 1,
-    borderColor: '#30363D',
+    borderColor: C3S_COLORS.border,
     borderRadius: 8,
-    color: '#E6EDF3',
+    color: C3S_COLORS.textPrimary,
     fontSize: 14,
     fontWeight: '600',
     paddingHorizontal: 10,
@@ -1043,13 +1054,13 @@ const styles = StyleSheet.create({
 
   // Error / locked text
   execError: {
-    color: '#EF9A9A',
+    color: C3S_COLORS.danger,
     fontSize: 13,
     fontWeight: '700',
     marginTop: 6,
   },
   execLocked: {
-    color: '#6E7681',
+    color: C3S_COLORS.textMuted,
     fontSize: 13,
     fontWeight: '600',
     marginTop: 4,
@@ -1058,17 +1069,17 @@ const styles = StyleSheet.create({
   // Primary action (Start Chill)
   primaryAction: {
     marginTop: 14,
-    backgroundColor: '#0277BD',
+    backgroundColor: C3S_COLORS.accent,
     borderRadius: 10,
     minHeight: 48,
     alignItems: 'center',
     justifyContent: 'center',
   },
   primaryActionDisabled: {
-    backgroundColor: '#37474F',
+    backgroundColor: C3S_COLORS.textMuted,
   },
   primaryActionText: {
-    color: '#E6EDF3',
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '800',
   },
@@ -1076,53 +1087,55 @@ const styles = StyleSheet.create({
   // Finish chill action (teal/green)
   finishAction: {
     marginTop: 14,
-    backgroundColor: '#00695C',
+    backgroundColor: C3S_COLORS.success,
     borderRadius: 10,
     minHeight: 48,
     alignItems: 'center',
     justifyContent: 'center',
   },
   finishActionText: {
-    color: '#E6EDF3',
+    color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '800',
   },
+  openBatchButton: { minHeight: 46, marginTop: 8, borderWidth: 1, borderColor: C3S_COLORS.accent, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  openBatchText: { color: C3S_COLORS.accent, fontSize: 14, fontWeight: '900' },
 
   // Deviation flag / resolve
   deviationFlagButton: {
-    marginTop: 10, borderWidth: 1, borderColor: '#FB8C00',
-    backgroundColor: '#1A0E00', borderRadius: 8, paddingVertical: 10,
+    marginTop: 10, borderWidth: 1, borderColor: C3S_COLORS.warning,
+    backgroundColor: C3S_COLORS.warningSoft, borderRadius: 8, paddingVertical: 10,
     alignItems: 'center',
   },
-  deviationFlagText: { color: '#FFB86B', fontSize: 13, fontWeight: '800' },
+  deviationFlagText: { color: C3S_COLORS.warning, fontSize: 13, fontWeight: '800' },
   deviationPanel: {
-    marginTop: 10, backgroundColor: '#1A0808', borderWidth: 1,
-    borderColor: '#7A2020', borderRadius: 8, padding: 10, gap: 8,
+    marginTop: 10, backgroundColor: C3S_COLORS.dangerSoft, borderWidth: 1,
+    borderColor: C3S_COLORS.danger, borderRadius: 8, padding: 10, gap: 8,
   },
   deviationPanelTitle: {
-    color: '#EF9A9A', fontSize: 11, fontWeight: '800',
+    color: C3S_COLORS.danger, fontSize: 11, fontWeight: '800',
     textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2,
   },
   deviationConfirmButton: {
-    backgroundColor: '#7A1F1F', borderRadius: 8, paddingVertical: 10,
+    backgroundColor: C3S_COLORS.danger, borderRadius: 8, paddingVertical: 10,
     alignItems: 'center', justifyContent: 'center',
   },
-  deviationConfirmText: { color: '#EF9A9A', fontSize: 13, fontWeight: '800' },
+  deviationConfirmText: { color: '#FFFFFF', fontSize: 13, fontWeight: '800' },
   resolveDeviationButton: {
-    marginTop: 10, borderWidth: 1, borderColor: '#26A69A',
-    backgroundColor: '#0D2A28', borderRadius: 8, paddingVertical: 10,
+    marginTop: 10, borderWidth: 1, borderColor: C3S_COLORS.success,
+    backgroundColor: C3S_COLORS.successSoft, borderRadius: 8, paddingVertical: 10,
     alignItems: 'center',
   },
-  resolveDeviationText: { color: '#80CBC4', fontSize: 13, fontWeight: '800' },
+  resolveDeviationText: { color: C3S_COLORS.success, fontSize: 13, fontWeight: '800' },
 
   // Empty states
   emptyTitle: {
-    color: '#9DA7B1',
+    color: C3S_COLORS.textMuted,
     fontSize: 14,
     fontWeight: '800',
   },
   emptySub: {
-    color: '#6E7681',
+    color: C3S_COLORS.textMuted,
     fontSize: 12,
     fontWeight: '600',
     marginTop: 4,
@@ -1130,24 +1143,24 @@ const styles = StyleSheet.create({
 
   // Loading / Error
   loadingText: {
-    color: '#8B949E',
+    color: C3S_COLORS.textMuted,
     fontSize: 14,
     fontWeight: '700',
   },
   errorText: {
-    color: '#EF9A9A',
+    color: C3S_COLORS.danger,
     fontSize: 14,
     fontWeight: '700',
   },
   retryButton: {
     marginTop: 10,
-    backgroundColor: '#1E3A5F',
+    backgroundColor: C3S_COLORS.accentSoft,
     borderRadius: 8,
     paddingVertical: 8,
     alignItems: 'center',
   },
   retryButtonText: {
-    color: '#81D4FA',
+    color: C3S_COLORS.accent,
     fontSize: 14,
     fontWeight: '800',
   },
