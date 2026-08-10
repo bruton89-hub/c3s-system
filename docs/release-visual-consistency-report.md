@@ -4,7 +4,7 @@ Date: 2026-08-10
 
 ## Release outcome
 
-C3S now uses one light operational design language across the complete route set. The release candidate is version **1.0.1** with iOS build **8**. This report is finalized after GitHub push and TestFlight submission so the immutable identifiers can be recorded below.
+C3S now uses one light operational design language across the complete route set. The release candidate is version **1.0.1** with iOS build **8**. The checkpoint is preserved on GitHub and the App Store artifact built successfully. TestFlight upload requires renewed Apple authentication before it can complete.
 
 ## Routes visually audited
 
@@ -90,10 +90,27 @@ The lifecycle test covers Prep/RTC through Thermal, Chill, QA, Packaging, and Co
 - New iOS build: **8**
 - Bundle identifier: `com.c3ssystem.preview`
 - EAS project: `@momentum_app/c3s-preview` (`7724c5f5-1a70-4af6-9120-4397c339b6cb`)
-- Release checkpoint commit: Pending
-- GitHub branch/push: Pending
-- EAS build: Pending
-- TestFlight upload: Pending
+- Release checkpoint commit: `8462536b61bd734e076d95b0c654a695686b6912`
+- EAS packaging safeguard commit: `8a9cce07c98763710a2be17d0adf4aa405e52b5f`
+- GitHub branch/push: `main` → `origin/main`, PASS
+- EAS build: `a19e78b3-b6e9-4e09-932a-263447c8d6fb`, FINISHED
+- TestFlight upload: BLOCKED before upload; App Store Connect authentication requires manual renewal
+
+## EAS and TestFlight result
+
+EAS produced a Store-distribution iOS artifact for version 1.0.1, build 8, from Git commit `8a9cce07c98763710a2be17d0adf4aa405e52b5f`. The build completed successfully with the existing Apple team, distribution certificate, and active provisioning profile.
+
+The first non-interactive submit attempt stopped because `submit.production.ios.ascAppId` is not configured. The authenticated interactive fallback then found the existing Apple ID, but its saved App Store Connect session had expired and the Keychain password was rejected; EAS removed the invalid cached password. No upload reached App Store Connect, so processing has not started.
+
+Required manual follow-up:
+
+1. Renew authentication for `bruton89@icloud.com` through the existing EAS submit workflow, including two-factor authentication if Apple requests it.
+2. Select the existing C3S App Store Connect application; do not create a duplicate app.
+3. Record that application's numeric App Store Connect ID as `submit.production.ios.ascAppId` in `eas.json`.
+4. Prefer configuring an App Store Connect API key in the existing EAS credentials workflow for repeatable non-interactive submissions.
+5. Re-run `eas submit --platform ios --profile production --id a19e78b3-b6e9-4e09-932a-263447c8d6fb`.
+
+This follow-up uploads the already-built artifact to TestFlight only; it must not request App Store production review.
 
 ## Environment safeguards
 
