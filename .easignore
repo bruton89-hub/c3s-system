@@ -1,0 +1,51 @@
+# Dependencies and local Expo state
+node_modules/
+.expo/
+.expo-shared/
+dist/
+dist-*/
+web-build/
+coverage/
+ios/
+android/
+
+# Local configuration, credentials, and emulator state
+.env
+.env.*
+!.env.example
+.firebaserc
+.firebase/
+.firebase-config/
+.firebase-data/
+firebase-export-*/
+google-services.json
+GoogleService-Info.plist
+*service-account*.json
+*serviceAccount*.json
+*.credentials.json
+*.pem
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# Release documentation and local QA assets are not part of the binary
+artifacts/
+docs/
+functions/
+tests/
+scripts/
+README 2.md
+
+# Backend and local diagnostics are intentionally not deployed by EAS
+firebase.json
+firestore.indexes.json
+firestore.rules
+firebase-debug*.log*
+firestore-debug.log*
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+*.tsbuildinfo
