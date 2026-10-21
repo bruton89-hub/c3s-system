@@ -89,6 +89,7 @@ function RootLayoutNav() {
         <Stack.Screen name="batch-timeline" options={{ headerShown: false }} />
         <Stack.Screen name="qa-review" options={{ headerShown: false }} />
         <Stack.Screen name="thermal-timeline" options={{ headerShown: false }} />
+        <Stack.Screen name="reload-planning" options={{ headerShown: false }} />
         <Stack.Screen name="products/index" options={{ headerShown: false }} />
         <Stack.Screen name="production-item" options={{ headerShown: false }} />
         <Stack.Screen name="hold" options={{ headerShown: false }} />
