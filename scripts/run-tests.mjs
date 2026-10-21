@@ -8,6 +8,7 @@ rmSync(outDir, { recursive: true, force: true });
 
 const compile = spawnSync(resolve(root, 'node_modules/.bin/tsc'), [
   'tests/alert-hold-core.test.ts',
+  'tests/reload-planning.test.ts',
   'lib/alerts/core.ts',
   'lib/holds/core.ts',
   'lib/operations/core.ts',
@@ -25,6 +26,6 @@ const compile = spawnSync(resolve(root, 'node_modules/.bin/tsc'), [
 ], { cwd: root, stdio: 'inherit' });
 
 if (compile.status !== 0) process.exit(compile.status ?? 1);
-const tests = spawnSync(process.execPath, ['--test', '.test-build/tests/alert-hold-core.test.js'], { cwd: root, stdio: 'inherit' });
+const tests = spawnSync(process.execPath, ['--test', '.test-build/tests/alert-hold-core.test.js', '.test-build/tests/reload-planning.test.js'], { cwd: root, stdio: 'inherit' });
 rmSync(outDir, { recursive: true, force: true });
 process.exit(tests.status ?? 1);

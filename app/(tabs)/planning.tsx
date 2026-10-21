@@ -553,6 +553,11 @@ export default function PlanningScreen() {
               </Pressable>
               <Pressable
                 style={[styles.navBtn, styles.navBtnAccent]}
+                onPress={() => router.push({ pathname: '/reload-planning', params: { week: toISODate(anchor) } })}>
+                <Text style={styles.navBtnText}>Reload plan</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.navBtn, styles.navBtnAccent]}
                 onPress={() => router.push('/thermal-timeline')}>
                 <Text style={styles.navBtnText}>Timeline</Text>
               </Pressable>
